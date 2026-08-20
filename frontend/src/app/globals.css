@@ -26,3 +26,25 @@ body {
   50%       { box-shadow: 0 0 8px 2px rgba(239,68,68,0.3); }
 }
 .pulse-critical { animation: pulse-red 2s ease-in-out infinite; }
+
+/* ── KaTeX dark-theme overrides ── */
+/* KaTeX renders inline/block math; force light text on the dark space bg */
+.triage-prose .katex,
+.triage-prose .katex-display {
+  color: #e2e8f0; /* slate-200 */
+}
+.triage-prose .katex-display {
+  margin: 0.75rem 0;
+  overflow-x: auto;
+}
+/* Remove KaTeX's default black colour rule that wins over our theme */
+.triage-prose .katex .mord,
+.triage-prose .katex .mbin,
+.triage-prose .katex .mrel,
+.triage-prose .katex .mop,
+.triage-prose .katex .mopen,
+.triage-prose .katex .mclose,
+.triage-prose .katex .mpunct,
+.triage-prose .katex .minner {
+  color: inherit;
+}

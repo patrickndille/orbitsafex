@@ -1,16 +1,16 @@
 
 ---
-# Space debris tracking and collision avoidance AI
+# Space debris tracking and collision avoidance AI (OrbitSafe AI)
 
 Detect hazardous objects, calculate collision probabilities, and execute thruster burns to steer spacecraft out of harm's way.
 
 ## CONCEPT
 
-Space debris tracking and collision avoidance is a real-time space debris conjunction warning and AI triage dashboard.
+Space debris tracking and collision avoidance (OrbitSafe AI) is a real-time space debris conjunction warning and AI triage dashboard.
 
-Low-earth orbit is increasingly congested, making tracking orbital debris and preventing collisions a critical challenge. True collision risk requires projecting orbits forward in time and calculating statistical probabilities based on velocity and uncertainty, rather than relying on raw distance thresholds.
+Low-Earth Orbit (LEO) is increasingly congested, making debris tracking and collision prevention a critical challenge. True collision risk requires projecting orbits forward in time and calculating statistical probabilities based on relative velocity, positional covariance, and encounter plane geometries, rather than relying on raw arbitrary distance thresholds.
 
-## Scope
+## Initial Scope
 
 1. **Data Ingestion & Caching**
 Fetch TLE (Two-Line Element) data from the CelesTrak API (Open source). Implement caching and rate-limiting to manage large catalog sizes without overloading the endpoint.
@@ -31,37 +31,78 @@ Build a simple React/Next.js interface displaying high-risk conjunction events o
 5. **Project Documentation**
 A full `README.md` detailing the problem, solution, AI architecture, and how IBM Bob was utilized.
 
-## Technical Stack
-
-* **Development:** IBM Bob (required primary tool)
-* **AI Model & Orchestration:** OpenAI Client / LangChain (FastAPI backend)
-* **Orbital Mechanics:** `sgp4`, `scipy`, `numpy` (for TLE propagation and $P_c$ math)
-* **Frontend:** Next.js, React with Three.js or Cesium.js
-* **Data Sources:** CelesTrak open telemetry API
-
 ## CelesTrak API
 
 * `[https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=json](https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=json)`
+
+
+## Architectural Transisiton: From CelesTrak to Space-Track.org
+
+During development, data ingestion was migrated from **CelesTrak** to **Space-Track.org**.
+
+* **Primary Rationale for Migration:**
+* **Data Timeliness & Accuracy:** Space-Track.org is operated directly by 18th Space Defense Squadron (18 SDS), serving as the authoritative source for General Perturbations (GP) element sets and satellite catalog data.
+* **Rate Limiting & Reliability:** Direct authentication against Space-Track via session cookies (`/app/data/whoami`) provides robust query access without encountering non-deterministic web-scraping rate limits or public mirror delays.
+* **Granular Query Filtering:** Space-Track enables server-side filtering via REST API endpoints (e.g., `/basicspacedata/query/class/gp/decay_date/null-val/CREATION_DATE/>now-0.042/format/json`), substantially reducing initial bandwidth and client-side processing loads.
+
+
+* **Fallback Strategy:** Successful responses automatically maintain a local JSON fallback (`data/gp_fallback.json`) to guarantee zero-downtime offline operational resilience if external API limits are reached.
+
+
+## Final Scope (Updated)
+
+1. **Data Ingestion & Caching**
+* Authenticate and stream full GP orbital element catalogs directly from Space-Track.org.
+* Maintain an automated disk-backed JSON fallback cache for offline availability.
+
+
+2. **AI Anomaly & Risk Scoring ($P_c$ Math)**
+* Propagate orbits forward using `sgp4` and filter targets into the LEO band (300–1200 km).
+* Calculate operational Probability of Collision ($P_c$) using Alfano's 2D Gaussian encounter plane integration.
+* Send collision metrics to LLM-driven endpoints for real-time evasive maneuver recommendations.
+
+
+3. **Natural Language Operator Query**
+* Support mission operator triage queries regarding risk thresholds ($P_c > 1\times 10^{-4}$) and emergency burn directions.
+
+
+4. **Interactive Dashboard**
+* Next.js/React frontend with Three.js rendering LEO satellite positions, conjunction vectors, and interactive risk drawer logs.
+
+
+5. **Project Documentation**
+* Complete operational documentation detailing orbital mechanics, API pipelines, and development history via IBM Bob.
+
+
+## Technical Stack
+
+* **Development:** IBM Bob (required primary development tool and AI collaborator)
+* **Backend Framework:** FastAPI (Python)
+* **AI Model & Orchestration:** LangChain / OpenAI Client (`gemini-3.5-flash-lite`(Dev) or IBM Granite models via OpenAI compatible endpoints)
+* **Orbital Mechanics and Physics:** `sgp4`, `scipy`, `numpy` (Alfano 2D Gaussian $P_c$ integration)
+* **Frontend:** Next.js, React, Tailwind CSS with Three.js
+* **Telemetry Data Source**  [Space-Track.org](https://www.space-track.org) REST API (Replacing CelesTrak)
+
+
 
 ## Core Logic (The Physics)
 
 Instead of a flat distance threshold, the system must evaluate real conjunction risk:
 
-* **SGP4 Propagation:** Forward-propagate TLEs to future epochs to find the Time of Closest Approach (TCA).
+* **SGP4 Propagation:** Propagate TLE/GP element sets forward to find the exact Time of Closest Approach (TCA).
+* **Spatial Pre-filtering ($O(n\log n)$ Optimization):** Sort satellites by altitude shells (300–1200 km) and utilize KD-Tree spatial indexing to eliminate unnecessary $O(n^2)$ pairwise orbital calculations.
+* **Probability of Collision ($P_c$):** Project combined covariance matrix $C$ onto the 2D encounter plane perpendicular to relative velocity:
 
-* **Probability of Collision ($P_c$):** Calculate risk by projecting the combined covariance matrix onto the 2D encounter plane perpendicular to the relative velocity vector. The calculation integrates the 2D Gaussian probability density function over the combined hard-body cross-sectional area $A$:
 
 $$P_c = \frac{1}{2\pi \sqrt{\vert{}C\vert{}}} \iint_{A} \exp\left(-\frac{1}{2} \vec{r}^T C^{-1} \vec{r}\right) dx dy$$
 
 
-* **$O(n^2)$ Mitigation:** Pairwise checking thousands of satellites is computationally heavy. Implement a pre-filter (e.g., altitude binning or a KD-Tree spatial index) to only run SGP4 and $P_c$ math on objects in similar orbital neighborhoods.
-
 ## Architecture
 
-Next.js, React, Tailwind CSS, and Three.js/Cesium.js for 3D visualization. 
+Next.js, React, Tailwind CSS, and Three.js for 3D visualization. 
 FastAPI backend for asynchronous orbital math and LLM routing.
 
-### Setup
+## Dependencies
 
 Install dependencies:
 
@@ -78,7 +119,7 @@ pip install -q \
 
 ```
 
-Python script (`app.py`):
+## Code Implementation (`app.py`)
 
 ```python
 import os
@@ -87,20 +128,16 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
-from cachetools import cached, TTLCache
 
-# Load variables from .env file into environment
 load_dotenv()
 
-# Access environment variables safely
 api_key = os.environ.get("OPENAI_API_KEY")
 base_url = os.environ.get("OPENAI_BASE_URL")
 
 app = FastAPI(title="OrbitSafe AI API")
 
-# Initialize the LangChain Chat Model
 llm = ChatOpenAI(
-    model="gemini-3.5-flash-lite", # Or target IBM Granite/watsonx model
+    model="gemini-3.5-flash-lite",
     api_key=api_key,
     base_url=base_url, 
     temperature=0.7,
@@ -112,7 +149,7 @@ class ConjunctionData(BaseModel):
     norad_id: int
     miss_distance_km: float
     relative_velocity_kms: float
-    pc_value: float  # Probability of Collision
+    pc_value: float
 
 @app.post("/api/triage")
 async def analyze_conjunction(data: ConjunctionData):
@@ -136,12 +173,7 @@ async def analyze_conjunction(data: ConjunctionData):
 
 ```
 
-Run the app:
 
-```bash
-uvicorn app:app --reload
-
-```
 
 ## Assets
 
@@ -154,35 +186,45 @@ Create a very clear `README.md` that includes:
 
 ## 
 
+
+
+## Current Project Status & Identified Gaps
+
+The primary data pipeline and frontend visualization are fully operational using Space-Track authentication and SGP4/KD-Tree mechanics.
+
+**Remaining Gaps to Address:**
+
+* **Legacy Reference Cleanup:** Strip remaining dead CelesTrak fallback branches and stale comments in `app.py` and `orbital_math.py`.
+* **Database & Persistence:** Replace in-memory scan results with lightweight storage (SQLite/JSON) to preserve historical conjunction trends.
+* **Frontend Triage Drawer Integration:** Confirm the interactive **Triage** button triggers `POST /api/triage` to populate the slide-out drawer with LLM maneuver instructions.
+* **Granular Scan UI Controls:** Expose altitude band filters (e.g., 300–600 km vs. 600–1200 km) directly within the dashboard header.
+
+
+**Space Track API Implementation guides and references**
+
+temp\space-track-api-guidelines.pdf
+temp\Space-Track-how-to-guides.pdf
+temp\space-track.org_basicspacedata_modeldef_class_gp_format.pdf 
+
+
 ```markdown
-Act as a Lead Full-Stack AI Engineer and Astrodynamicist for a space exploration project.
-Build a space debris tracking and collision avoidance dashboard named 'OrbitSafe AI' using Next.js, React, Tailwind CSS, FastAPI, and standard 3D rendering (Three.js or Cesium.js).
 
-1. Data Ingestion & Orbital Logic (Python Backend):
-- Create a dedicated module (services/orbital_math.py) to handle physics.
-- Fetch active satellite telemetry (TLE format) from CelesTrak: https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=json.
-- Implement API caching (e.g., TTLCache) to prevent rate-limiting.
-- Implement spatial filtering (e.g., altitude binning or KD-trees) to avoid O(n²) brute-force comparisons.
-- Use the `sgp4` library to forward-propagate orbits to find the Time of Closest Approach (TCA).
-- Calculate the Probability of Collision (Pc) using relative velocity, miss distance, and covariance.
+Role & Context:
+You are IBM Bob, the Lead Full-Stack AI Engineer and Astrodynamicist for this space exploration project, continuing development on OrbitSafe AI — a space debris conjunction analysis and AI-driven triage system built with FastAPI, LangChain, and React/Next.js.
 
-2. FastAPI Backend Endpoints (`app.py`):
-- Set up an asynchronous Python FastAPI server (`app.py`) using `langchain-openai`, `pydantic`, and `python-dotenv`.
-- Endpoint 1 (`GET /api/scan_conjunctions`): Triggers the `orbital_math.py` engine, calculates current risks, and returns a JSON array of conjunction events containing `norad_id`, `miss_distance_km`, `relative_velocity_kms`, and `pc_value`.
-- Endpoint 2 (`POST /api/triage`): Receives specific conjunction parameters (`sat_name`, `norad_id`, `miss_distance_km`, `relative_velocity_kms`, `pc_value`) from the frontend and uses `langchain-openai` (ChatOpenAI via OPENAI_BASE_URL) to return automated, natural language evasive maneuver summaries.
+Current Architecture & Status:
+1. Space-Track API: Fully functional authentication (`/app/data/whoami`) and GP catalog retrieval (`/basicspacedata/query/class/gp/decay_date/null-val/CREATION_DATE/>now-0.042/format/json`).
+2. Astrodynamics Pipeline (`orbital_math.py`): Propagates full GP catalog via SGP4, filters to LEO band (300–1200 km), sorts by altitude, runs KD-Tree pre-filtering, and computes Pc using Alfano's 2-D Gaussian encounter plane integration.
+3. Fallback: Local fallback (`data/gp_fallback.json`) is maintained automatically on every successful fetch. CelesTrak has been completely removed.
+4. UI: React dashboard successfully displaying live conjunction events with risk levels (Critical, High, Elevated, Monitor).
 
-3. Frontend Dashboard (Next.js & Tailwind CSS):
-- Build a responsive dashboard UI with a 3D Earth globe rendering active satellites and high-risk debris nodes using Three.js or Cesium.js.
-- Include an interactive table that fetches data from `/api/scan_conjunctions` and displays flagged conjunction events (sorted by Pc value) with search/filter controls by NORAD ID.
-- Add a triage drawer that triggers `/api/triage` when an operator clicks a specific row, displaying the AI action recommendation in natural language action fetched from the backend API.
+Next Task Objectives:
+1. Clean Up Legacy Code: Strip any remaining CelesTrak imports, fallback dead code, or stale docstrings across `app.py` and `orbital_math.py`.
+2. UI Triage Integration: Verify and ensure the frontend "Triage" button triggers `POST /api/triage` and cleanly renders the AI risk assessment and evasive maneuver recommendations in the slide-out drawer.
+3. Data Persistence: Add lightweight local storage (SQLite/JSON) for scanned conjunction events so historical scans can be reviewed.
 
-4. Project Documentation & Deliverables:
-- Create a project README.md structured for hackathon judging criteria that details:
-  * Problem statement & solution description (Advance Space Exploration with AI theme).
-  * System architecture & AI approach (FastAPI + LangChain + Next.js + Three.js).
-  * Explanation of the SGP4 and Pc mathematical approach to prove the physics are sound.
-  * Data ingestion details via CelesTrak API.
-  * Explicit section documenting how IBM Bob was used as the primary development tool for code generation, debugging, and UI design.
+Please confirm you have ingested this context and list the step-by-step changes you plan to make.
 
 ```
+
 

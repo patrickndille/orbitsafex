@@ -2,9 +2,11 @@
 app.py – OrbitSafe AI  FastAPI backend
 ═══════════════════════════════════════════════════════════════════════════════
 Endpoints
-  GET  /api/scan_conjunctions   →  run orbital scan, return risk list
-  POST /api/triage              →  LLM evasive-maneuver recommendation
-  GET  /healthz                 →  liveness probe
+  GET  /api/scan_conjunctions      →  run orbital scan, return risk list
+  POST /api/triage                 →  LLM evasive-maneuver recommendation
+  GET  /api/history                →  list of past scan summaries
+  GET  /api/history/{scan_id}      →  events for a specific historical scan
+  GET  /healthz                    →  liveness probe
 """
 
 from __future__ import annotations
@@ -19,6 +21,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
+
+import time
+from services.orbital_math import get_active_gp_source, get_gp_cache_info
+from services.db import init_db, save_scan, get_scan_history, get_scan_events
 
 load_dotenv()
 
@@ -49,6 +55,8 @@ llm = ChatOpenAI(
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     logger.info("OrbitSafe AI backend starting up …")
+    init_db()
+    logger.info("SQLite database initialised.")
     yield
     logger.info("OrbitSafe AI backend shutting down.")
 
@@ -88,21 +96,57 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/api/gp-source", tags=["ops"])
+async def gp_source():
+    return {
+        "configured_source": os.environ.get("GP_SOURCE", "auto"),
+        "active_source": get_active_gp_source(),
+        "cache": get_gp_cache_info(),
+    }
+
+
 @app.get("/api/scan_conjunctions", tags=["orbital"])
 async def scan_conjunctions(max_objects: int = 400):
     """
     Trigger a full orbital scan.
 
-    Fetches TLE data from CelesTrak (TTLCache 15 min), runs SGP4
-    forward-propagation on KD-Tree pre-filtered pairs, and returns a
-    list of conjunction events sorted by descending Pc.
+    Fetches GP data from Space-Track.org (3-hour cache, local fallback),
+    runs SGP4 forward-propagation on KD-Tree pre-filtered LEO pairs, and
+    returns a list of conjunction events sorted by descending Pc.
     """
     try:
         from services.orbital_math import run_conjunction_scan
         events = run_conjunction_scan(max_objects=max_objects)
-        return {"count": len(events), "events": events}
+        scan_id = save_scan(events)
+        logger.info("Scan persisted as scan_id=%d (%d events).", scan_id, len(events))
+        return {"scan_id": scan_id, "count": len(events), "events": events}
     except Exception as exc:
         logger.exception("Conjunction scan failed.")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/history", tags=["history"])
+async def list_scans(limit: int = 20):
+    """Return the most recent scan summaries (newest first)."""
+    try:
+        return {"scans": get_scan_history(limit=limit)}
+    except Exception as exc:
+        logger.exception("Failed to retrieve scan history.")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/history/{scan_id}", tags=["history"])
+async def get_historical_scan(scan_id: int):
+    """Return all conjunction events for a historical scan."""
+    try:
+        events = get_scan_events(scan_id)
+        if not events:
+            raise HTTPException(status_code=404, detail=f"Scan {scan_id} not found or has no events.")
+        return {"scan_id": scan_id, "count": len(events), "events": events}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to retrieve scan %d.", scan_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

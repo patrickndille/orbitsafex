@@ -9,6 +9,11 @@
 import { useEffect, useState } from "react";
 import { X, AlertTriangle, Zap, Loader2, RefreshCw } from "lucide-react";
 import clsx from "clsx";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import type { Components } from "react-markdown";
 import type { ConjunctionEvent, TriageResponse } from "@/lib/types";
 import { getRiskTier, formatPc } from "@/lib/types";
 import { requestTriage } from "@/lib/api";
@@ -30,6 +35,72 @@ const TIER_GLOW: Record<string, string> = {
   HIGH:     "shadow-[0_0_30px_rgba(249,115,22,0.12)]",
   ELEVATED: "shadow-[0_0_30px_rgba(234,179,8,0.10)]",
   MONITOR:  "",
+};
+
+// ── Markdown component overrides — dark-theme styled ─────────────────────────
+const MARKDOWN_COMPONENTS: Components = {
+  // Paragraphs — standard spacing
+  p: ({ children }) => (
+    <p className="mb-3 last:mb-0 text-slate-200 leading-relaxed">{children}</p>
+  ),
+  // Bold
+  strong: ({ children }) => (
+    <strong className="font-semibold text-slate-100">{children}</strong>
+  ),
+  // Italic
+  em: ({ children }) => (
+    <em className="italic text-slate-300">{children}</em>
+  ),
+  // Unordered list
+  ul: ({ children }) => (
+    <ul className="mb-3 space-y-1 pl-4 list-disc marker:text-slate-500">{children}</ul>
+  ),
+  // Ordered list
+  ol: ({ children }) => (
+    <ol className="mb-3 space-y-1 pl-4 list-decimal marker:text-slate-500">{children}</ol>
+  ),
+  // List item
+  li: ({ children }) => (
+    <li className="text-slate-200 leading-relaxed pl-1">{children}</li>
+  ),
+  // H1–H3 headings (LLM occasionally uses these for section headers)
+  h1: ({ children }) => (
+    <h1 className="mt-4 mb-2 text-base font-bold text-slate-100 border-b border-slate-700/60 pb-1">
+      {children}
+    </h1>
+  ),
+  h2: ({ children }) => (
+    <h2 className="mt-4 mb-1.5 text-sm font-bold text-slate-100">{children}</h2>
+  ),
+  h3: ({ children }) => (
+    <h3 className="mt-3 mb-1 text-sm font-semibold text-blue-300">{children}</h3>
+  ),
+  // Inline code
+  code: ({ children, className }) => {
+    const isBlock = className?.includes("language-");
+    if (isBlock) {
+      return (
+        <code className="block bg-space-950/80 border border-slate-700/60 rounded-md px-3 py-2 text-xs font-mono text-green-300 overflow-x-auto my-2">
+          {children}
+        </code>
+      );
+    }
+    return (
+      <code className="bg-slate-700/60 rounded px-1 py-0.5 text-xs font-mono text-green-300">
+        {children}
+      </code>
+    );
+  },
+  // Fenced code block wrapper — strip the pre since code handles it
+  pre: ({ children }) => <>{children}</>,
+  // Horizontal rule
+  hr: () => <hr className="my-3 border-slate-700/60" />,
+  // Blockquote
+  blockquote: ({ children }) => (
+    <blockquote className="border-l-2 border-blue-500/50 pl-3 my-2 text-slate-400 italic">
+      {children}
+    </blockquote>
+  ),
 };
 
 export default function TriageDrawer({ event, onClose }: Props) {
@@ -193,8 +264,14 @@ export default function TriageDrawer({ event, onClose }: Props) {
                     <div className="text-xs text-slate-500 mb-2 font-medium uppercase tracking-wide">
                       Operations Summary
                     </div>
-                    <div className="text-sm text-slate-200 whitespace-pre-wrap leading-relaxed">
-                      {result.summary}
+                    <div className="triage-prose text-sm text-slate-200 leading-relaxed">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm, remarkMath]}
+                        rehypePlugins={[rehypeKatex]}
+                        components={MARKDOWN_COMPONENTS}
+                      >
+                        {result.summary}
+                      </ReactMarkdown>
                     </div>
                   </div>
                   <p className="text-xs text-slate-600 italic">

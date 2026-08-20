@@ -20,11 +20,13 @@ import {
   Activity,
   Globe2,
   CheckCircle2,
+  History,
 } from "lucide-react";
 import clsx from "clsx";
 
 import ConjunctionTable from "@/components/ConjunctionTable";
 import TriageDrawer from "@/components/TriageDrawer";
+import ScanHistoryDrawer from "@/components/ScanHistoryDrawer";
 import type { ConjunctionEvent } from "@/lib/types";
 import { fetchConjunctions } from "@/lib/api";
 import { getRiskTier } from "@/lib/types";
@@ -74,6 +76,7 @@ export default function DashboardPage() {
   const [lastScan, setLastScan] = useState<Date | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [selectedEvent, setSelectedEvent] = useState<ConjunctionEvent | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const runScan = useCallback(async () => {
     setLoading(true);
@@ -133,6 +136,14 @@ export default function DashboardPage() {
               Last scan: {lastScan.toUTCString().substring(17, 25)} UTC
             </span>
           )}
+
+          <button
+            onClick={() => setHistoryOpen(true)}
+            className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-slate-700 text-slate-400 text-sm font-medium hover:border-slate-500 hover:text-slate-200 transition"
+          >
+            <History className="w-3.5 h-3.5" />
+            History
+          </button>
 
           <button
             onClick={runScan}
@@ -250,7 +261,7 @@ export default function DashboardPage() {
 
       {/* ── Footer ────────────────────────────────────────────────────── */}
       <footer className="px-6 py-3 border-t border-slate-800 text-xs text-slate-700 flex items-center justify-between">
-        <span>OrbitSafe AI · Orbital data via CelesTrak · SGP4 propagation · LangChain triage</span>
+        <span>OrbitSafe AI · Orbital data via Space-Track.org · SGP4 propagation · LangChain triage</span>
         <span>Built with IBM Bob</span>
       </footer>
 
@@ -258,6 +269,16 @@ export default function DashboardPage() {
       <TriageDrawer
         event={selectedEvent}
         onClose={() => setSelectedEvent(null)}
+      />
+
+      {/* ── Scan History Drawer ───────────────────────────────────────── */}
+      <ScanHistoryDrawer
+        open={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+        onLoadScan={(historicalEvents) => {
+          setEvents(historicalEvents);
+          setLastScan(null);
+        }}
       />
     </div>
   );

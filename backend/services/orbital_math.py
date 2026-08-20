@@ -4,7 +4,8 @@ orbital_math.py
 Core astrodynamics engine for OrbitSafe AI.
 
 Pipeline
-  1. Fetch live TLE/GP data from CelesTrak (TTLCache, 15-min refresh)
+  1. Fetch live GP data from Space-Track.org (3-hour in-memory cache,
+     local JSON fallback on every successful fetch)
   2. Build a KD-Tree altitude index to pre-filter candidate pairs  (O(n log n))
   3. For each candidate pair run SGP4 forward-propagation to find TCA
   4. Project the combined covariance onto the 2-D encounter plane
@@ -24,10 +25,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from pathlib import Path
 
-import requests.exceptions
-
 import numpy as np
-import requests
 from scipy.integrate import dblquad
 from scipy.spatial import KDTree
 from sgp4.api import Satrec, WGS72, jday
@@ -39,11 +37,6 @@ XP3O15 = 1440.0 / (2.0 * math.pi)   # converts rev/day → rad/min
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-# CelesTrak OMM JSON format — supports 6-digit+ catalog numbers and all OMM
-# fields. FORMAT=JSON (uppercase) selects the modern OMM/JSON schema.
-CELESTRAK_URL = (
-    "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=JSON"
-)
 EARTH_RADIUS_KM = 6371.0        # mean Earth radius
 ALT_BIN_WIDTH_KM = 50.0         # altitude bin for spatial pre-filter
 PROPAGATION_STEP_S = 60.0       # seconds between propagation steps
@@ -67,96 +60,40 @@ _active_gp_source: str = "none"
 _gp_cache_info: dict = {"age_seconds": None, "record_count": 0, "last_fetch_source": "none", "last_fetch_ts": 0.0}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CelesTrak data fetch (3-hour cache — respects the 2-hour update cycle)
+# GP data cache — stale-while-revalidate pattern
 # ──────────────────────────────────────────────────────────────────────────────
-#
-# Design: manual stale-while-revalidate pattern.
-#   _gp_cache_data  – last successful payload (survives 403 / transient errors)
+#   _gp_cache_data  – last successful payload (survives transient errors)
 #   _gp_cache_ts    – Unix timestamp of that fetch
 #   _GP_CACHE_TTL   – how long before we attempt a refresh (3 h)
-#
-# On a 403 / rate-limit we log a warning and return the stale payload
-# (if one exists) rather than crashing the scan endpoint.
-# On transient network errors we retry up to _FETCH_MAX_RETRIES times
-# with exponential back-off before falling back to stale data.
 # ──────────────────────────────────────────────────────────────────────────────
-_GP_CACHE_TTL     = 10800          # 3 hours — CelesTrak updates every ~2 h
-_FETCH_MAX_RETRIES = 3             # retries for transient errors (not 403)
+_GP_CACHE_TTL     = 10800          # 3 hours — Space-Track GP update cadence
+_FETCH_MAX_RETRIES = 3             # retries for transient errors
 _FETCH_BACKOFF_BASE = 2.0          # seconds; doubled each retry
 
 _gp_cache_data: Optional[list] = None
 _gp_cache_ts:   float          = 0.0
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-}
-
 
 def _resolve_source_order(source: str) -> list[str]:
-    """
-    Return ordered list of sources to try based on GP_SOURCE config.
+    """Return ordered list of data sources to try based on GP_SOURCE env var.
 
-    CelesTrak is currently unreachable (ERR_CONNECTION_TIMED_OUT) and is
-    excluded from the automatic fallback chain. Set GP_SOURCE=celestrak
-    explicitly to re-enable it when connectivity is restored.
+    Supported values: "auto" | "space-track" | "local"
     """
     if source == "space-track":
         return ["space-track", "local"]
-    if source == "celestrak":
-        return ["celestrak", "local"]
     if source == "local":
         return ["local"]
-    # "auto" default: Space-Track → local (CelesTrak excluded until reachable)
+    # "auto" default: Space-Track → local fallback
     return ["space-track", "local"]
 
 
 def _fetch_space_track() -> Optional[list[dict]]:
-    """Fetch from Space-Track.org if credentials available."""
+    """Fetch GP data from Space-Track.org if credentials are configured."""
     if not SPACE_TRACK_USERNAME or not SPACE_TRACK_PASSWORD:
         return None
     from services.space_track import SpaceTrackClient
     client = SpaceTrackClient(SPACE_TRACK_USERNAME, SPACE_TRACK_PASSWORD)
     return client.fetch_gp_data()
-
-
-def _fetch_celestrak() -> Optional[list[dict]]:
-    """Fetch from CelesTrak (renamed from _do_fetch)."""
-    delay = _FETCH_BACKOFF_BASE
-    last_exc: Exception = RuntimeError("no attempt made")
-
-    for attempt in range(1, _FETCH_MAX_RETRIES + 1):
-        try:
-            resp = requests.get(CELESTRAK_URL, headers=_HEADERS, timeout=30)
-
-            if resp.status_code in (403, 429):
-                resp.raise_for_status()
-
-            resp.raise_for_status()
-            records = resp.json()
-            logger.info("Fetched %d GP records from CelesTrak (attempt %d).", len(records), attempt)
-            return records
-
-        except requests.exceptions.HTTPError:
-            raise
-
-        except Exception as exc:
-            last_exc = exc
-            if attempt < _FETCH_MAX_RETRIES:
-                logger.warning(
-                    "CelesTrak fetch attempt %d/%d failed (%s). Retrying in %.0f s …",
-                    attempt, _FETCH_MAX_RETRIES, exc, delay,
-                )
-                time.sleep(delay)
-                delay *= 2
-            else:
-                logger.error("CelesTrak fetch failed after %d attempts: %s", _FETCH_MAX_RETRIES, exc)
-
-    raise last_exc
 
 
 def _load_local_fallback() -> Optional[list[dict]]:
@@ -199,8 +136,8 @@ def _update_cache(records: list[dict], source: str) -> list[dict]:
 
 def fetch_gp_data() -> list[dict]:
     """
-    Fetch GP records with priority: Space-Track → CelesTrak → Local fallback.
-    Controlled by GP_SOURCE env var: "auto" | "space-track" | "celestrak" | "local"
+    Fetch GP records with priority: Space-Track → local fallback.
+    Controlled by GP_SOURCE env var: "auto" | "space-track" | "local"
     """
     global _gp_cache_data, _gp_cache_ts, _gp_cache_info
 
@@ -212,8 +149,6 @@ def fetch_gp_data() -> list[dict]:
         try:
             if src == "space-track":
                 records = _fetch_space_track()
-            elif src == "celestrak":
-                records = _fetch_celestrak()
             elif src == "local":
                 records = _load_local_fallback()
         except Exception as exc:
@@ -293,12 +228,11 @@ _SGP4_ERRORS = {
 
 
 # ── OMM JSON → sgp4init field map ───────────────────────────────────────────
-# CelesTrak's OMM JSON schema uses CCSDS OMM field names.  Map each OMM key
-# to the legacy GP key so _build_satrec works with both response formats.
+# Space-Track OMM JSON uses CCSDS OMM field names.  Map each OMM key to the
+# legacy GP key so _build_satrec works with both response formats.
 #
 # OMM field          Legacy GP field    Notes
 # ─────────────────────────────────────────────────────────────────
-# CCSDS_OMM_VERS     —                  format discriminator
 # NORAD_CAT_ID       NORAD_CAT_ID       same in both
 # OBJECT_NAME        OBJECT_NAME        same in both
 # EPOCH              EPOCH              same in both
@@ -338,7 +272,7 @@ def _normalise_gp(gp: dict) -> dict:
 
 
 def _build_satrec(gp: dict) -> Optional[Satrec]:
-    """Construct a Satrec object directly from CelesTrak GP/OMM JSON parameters."""
+    """Construct a Satrec object from Space-Track GP/OMM JSON parameters."""
     try:
         gp = _normalise_gp(gp)
 

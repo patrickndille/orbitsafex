@@ -1,6 +1,12 @@
 // lib/api.ts – typed API client
 
-import type { ScanResponse, TriageRequest, TriageResponse } from "./types";
+import type {
+  ScanResponse,
+  TriageRequest,
+  TriageResponse,
+  HistoryListResponse,
+  HistoryScanResponse,
+} from "./types";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -31,4 +37,28 @@ export async function requestTriage(
     throw new Error(`triage failed [${res.status}]: ${detail}`);
   }
   return res.json() as Promise<TriageResponse>;
+}
+
+export async function fetchHistory(limit = 20): Promise<HistoryListResponse> {
+  const res = await fetch(`${BASE}/api/history?limit=${limit}`, {
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`history failed [${res.status}]: ${detail}`);
+  }
+  return res.json() as Promise<HistoryListResponse>;
+}
+
+export async function fetchHistoricalScan(
+  scanId: number
+): Promise<HistoryScanResponse> {
+  const res = await fetch(`${BASE}/api/history/${scanId}`, {
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`history/${scanId} failed [${res.status}]: ${detail}`);
+  }
+  return res.json() as Promise<HistoryScanResponse>;
 }

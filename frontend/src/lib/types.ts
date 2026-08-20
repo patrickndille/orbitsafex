@@ -32,6 +32,22 @@ export interface TriageResponse {
   summary: string;
 }
 
+export interface ScanSummary {
+  id: number;
+  scanned_at: string;   // ISO-8601 UTC
+  event_count: number;
+}
+
+export interface HistoryListResponse {
+  scans: ScanSummary[];
+}
+
+export interface HistoryScanResponse {
+  scan_id: number;
+  count: number;
+  events: ConjunctionEvent[];
+}
+
 export type RiskTier = "CRITICAL" | "HIGH" | "ELEVATED" | "MONITOR";
 
 export function getRiskTier(pc: number): RiskTier {
