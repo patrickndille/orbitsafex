@@ -21,9 +21,10 @@ import datetime
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import requests.exceptions
+
 import numpy as np
 import requests
-from cachetools import TTLCache, cached
 from scipy.integrate import dblquad
 from scipy.spatial import KDTree
 from sgp4.api import Satrec, WGS72, jday
@@ -51,7 +52,23 @@ logger = logging.getLogger("orbital_math")
 # ──────────────────────────────────────────────────────────────────────────────
 # CelesTrak data fetch (3-hour cache — respects the 2-hour update cycle)
 # ──────────────────────────────────────────────────────────────────────────────
-_tle_cache: TTLCache = TTLCache(maxsize=1, ttl=10800)  # 3 hours (CelesTrak updates every 2 h)
+#
+# Design: manual stale-while-revalidate pattern.
+#   _gp_cache_data  – last successful payload (survives 403 / transient errors)
+#   _gp_cache_ts    – Unix timestamp of that fetch
+#   _GP_CACHE_TTL   – how long before we attempt a refresh (3 h)
+#
+# On a 403 / rate-limit we log a warning and return the stale payload
+# (if one exists) rather than crashing the scan endpoint.
+# On transient network errors we retry up to _FETCH_MAX_RETRIES times
+# with exponential back-off before falling back to stale data.
+# ──────────────────────────────────────────────────────────────────────────────
+_GP_CACHE_TTL     = 10800          # 3 hours — CelesTrak updates every ~2 h
+_FETCH_MAX_RETRIES = 3             # retries for transient errors (not 403)
+_FETCH_BACKOFF_BASE = 2.0          # seconds; doubled each retry
+
+_gp_cache_data: Optional[list] = None
+_gp_cache_ts:   float          = 0.0
 
 _HEADERS = {
     "User-Agent": (
@@ -63,26 +80,105 @@ _HEADERS = {
 }
 
 
-@cached(_tle_cache)
+def _do_fetch() -> list[dict]:
+    """
+    Single HTTP fetch with exponential back-off for transient failures.
+    Raises immediately on 403/429 (rate-limit) — caller handles those.
+    """
+    delay = _FETCH_BACKOFF_BASE
+    last_exc: Exception = RuntimeError("no attempt made")
+
+    for attempt in range(1, _FETCH_MAX_RETRIES + 1):
+        try:
+            resp = requests.get(CELESTRAK_URL, headers=_HEADERS, timeout=30)
+
+            # Do not retry rate-limit / auth errors — surface immediately
+            if resp.status_code in (403, 429):
+                resp.raise_for_status()
+
+            resp.raise_for_status()
+            records = resp.json()
+            logger.info("Fetched %d GP records (attempt %d).", len(records), attempt)
+            return records
+
+        except requests.exceptions.HTTPError:
+            raise  # 403/429 or other HTTP error — let caller decide
+
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _FETCH_MAX_RETRIES:
+                logger.warning(
+                    "CelesTrak fetch attempt %d/%d failed (%s). "
+                    "Retrying in %.0f s …",
+                    attempt, _FETCH_MAX_RETRIES, exc, delay,
+                )
+                time.sleep(delay)
+                delay *= 2
+            else:
+                logger.error(
+                    "CelesTrak fetch failed after %d attempts: %s",
+                    _FETCH_MAX_RETRIES, exc,
+                )
+
+    raise last_exc
+
+
 def fetch_gp_data() -> list[dict]:
     """
-    Return raw GP records from CelesTrak (cached 15 min).
+    Return GP records from CelesTrak with stale-while-revalidate caching.
 
-    A User-Agent header is required; CelesTrak returns 403 for
-    bare requests with no User-Agent.  On any error the cache key
-    is evicted so the next call retries instead of serving a cached
-    failure.
+    Behaviour by error type
+    ───────────────────────
+    • 403 / 429 (rate-limit)  – log a warning, return stale cache if
+                                 available, otherwise raise so the API
+                                 returns a clear 500 to the operator.
+    • Transient network error – retry up to _FETCH_MAX_RETRIES times
+                                 with exponential back-off, then fall
+                                 back to stale cache if available.
+    • Cache fresh (< 3 h old) – return cached data without any request.
     """
+    global _gp_cache_data, _gp_cache_ts
+
+    now = time.time()
+    cache_age = now - _gp_cache_ts
+
+    # Cache is still fresh — return immediately
+    if _gp_cache_data is not None and cache_age < _GP_CACHE_TTL:
+        logger.debug("Returning cached GP data (age %.0f s).", cache_age)
+        return _gp_cache_data
+
     logger.info("Fetching fresh TLE data from CelesTrak …")
     try:
-        resp = requests.get(CELESTRAK_URL, headers=_HEADERS, timeout=30)
-        resp.raise_for_status()
-        records = resp.json()
-        logger.info("Fetched %d GP records.", len(records))
+        records = _do_fetch()
+        _gp_cache_data = records
+        _gp_cache_ts   = now
         return records
-    except Exception:
-        # Evict the (empty) cache entry so the next request retries.
-        _tle_cache.clear()
+
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        if status in (403, 429):
+            logger.warning(
+                "CelesTrak returned %s (rate-limited). "
+                "Serving stale cache (%d records, age %.0f s)." if _gp_cache_data
+                else "CelesTrak returned %s (rate-limited) and no cached data available.",
+                status,
+                *(
+                    (len(_gp_cache_data), cache_age)
+                    if _gp_cache_data else ()
+                ),
+            )
+            if _gp_cache_data:
+                return _gp_cache_data
+        raise
+
+    except Exception as exc:
+        if _gp_cache_data:
+            logger.warning(
+                "CelesTrak fetch failed (%s). "
+                "Serving stale cache (%d records, age %.0f s).",
+                exc, len(_gp_cache_data), cache_age,
+            )
+            return _gp_cache_data
         raise
 
 
