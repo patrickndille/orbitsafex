@@ -18,8 +18,11 @@ import logging
 import math
 import time
 import datetime
+import os
+import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+from pathlib import Path
 
 import requests.exceptions
 
@@ -52,6 +55,18 @@ PC_THRESHOLD = 1e-6             # report only conjunctions above this Pc
 logger = logging.getLogger("orbital_math")
 
 # ──────────────────────────────────────────────────────────────────────────────
+# GP Source Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+_GP_SOURCE = os.environ.get("GP_SOURCE", "auto").lower()
+_FALLBACK_PATH = Path(__file__).parent.parent / "data" / "gp_fallback.json"
+SPACE_TRACK_USERNAME = os.environ.get("SPACE_TRACK_USERNAME", "")
+SPACE_TRACK_PASSWORD = os.environ.get("SPACE_TRACK_PASSWORD", "")
+
+# Active source tracking for health endpoint
+_active_gp_source: str = "none"
+_gp_cache_info: dict = {"age_seconds": None, "record_count": 0, "last_fetch_source": "none", "last_fetch_ts": 0.0}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CelesTrak data fetch (3-hour cache — respects the 2-hour update cycle)
 # ──────────────────────────────────────────────────────────────────────────────
 #
@@ -82,11 +97,35 @@ _HEADERS = {
 }
 
 
-def _do_fetch() -> list[dict]:
+def _resolve_source_order(source: str) -> list[str]:
     """
-    Single HTTP fetch with exponential back-off for transient failures.
-    Raises immediately on 403/429 (rate-limit) — caller handles those.
+    Return ordered list of sources to try based on GP_SOURCE config.
+
+    CelesTrak is currently unreachable (ERR_CONNECTION_TIMED_OUT) and is
+    excluded from the automatic fallback chain. Set GP_SOURCE=celestrak
+    explicitly to re-enable it when connectivity is restored.
     """
+    if source == "space-track":
+        return ["space-track", "local"]
+    if source == "celestrak":
+        return ["celestrak", "local"]
+    if source == "local":
+        return ["local"]
+    # "auto" default: Space-Track → local (CelesTrak excluded until reachable)
+    return ["space-track", "local"]
+
+
+def _fetch_space_track() -> Optional[list[dict]]:
+    """Fetch from Space-Track.org if credentials available."""
+    if not SPACE_TRACK_USERNAME or not SPACE_TRACK_PASSWORD:
+        return None
+    from services.space_track import SpaceTrackClient
+    client = SpaceTrackClient(SPACE_TRACK_USERNAME, SPACE_TRACK_PASSWORD)
+    return client.fetch_gp_data()
+
+
+def _fetch_celestrak() -> Optional[list[dict]]:
+    """Fetch from CelesTrak (renamed from _do_fetch)."""
     delay = _FETCH_BACKOFF_BASE
     last_exc: Exception = RuntimeError("no attempt made")
 
@@ -94,94 +133,124 @@ def _do_fetch() -> list[dict]:
         try:
             resp = requests.get(CELESTRAK_URL, headers=_HEADERS, timeout=30)
 
-            # Do not retry rate-limit / auth errors — surface immediately
             if resp.status_code in (403, 429):
                 resp.raise_for_status()
 
             resp.raise_for_status()
             records = resp.json()
-            logger.info("Fetched %d GP records (attempt %d).", len(records), attempt)
+            logger.info("Fetched %d GP records from CelesTrak (attempt %d).", len(records), attempt)
             return records
 
         except requests.exceptions.HTTPError:
-            raise  # 403/429 or other HTTP error — let caller decide
+            raise
 
         except Exception as exc:
             last_exc = exc
             if attempt < _FETCH_MAX_RETRIES:
                 logger.warning(
-                    "CelesTrak fetch attempt %d/%d failed (%s). "
-                    "Retrying in %.0f s …",
+                    "CelesTrak fetch attempt %d/%d failed (%s). Retrying in %.0f s …",
                     attempt, _FETCH_MAX_RETRIES, exc, delay,
                 )
                 time.sleep(delay)
                 delay *= 2
             else:
-                logger.error(
-                    "CelesTrak fetch failed after %d attempts: %s",
-                    _FETCH_MAX_RETRIES, exc,
-                )
+                logger.error("CelesTrak fetch failed after %d attempts: %s", _FETCH_MAX_RETRIES, exc)
 
     raise last_exc
 
 
+def _load_local_fallback() -> Optional[list[dict]]:
+    """Load GP data from local fallback file."""
+    if _FALLBACK_PATH.exists():
+        try:
+            records = json.loads(_FALLBACK_PATH.read_text())
+            logger.info("Loaded %d GP records from local fallback", len(records))
+            return records
+        except Exception as exc:
+            logger.error("Failed to load local fallback: %s", exc)
+    return None
+
+
+def _maybe_write_fallback(records: list[dict]) -> None:
+    """Write/update local fallback file on every successful fetch."""
+    try:
+        _FALLBACK_PATH.parent.mkdir(exist_ok=True)
+        _FALLBACK_PATH.write_text(json.dumps(records))
+        logger.debug("Updated local GP fallback (%d records)", len(records))
+    except Exception as exc:
+        logger.warning("Failed to write local fallback: %s", exc)
+
+
+def _update_cache(records: list[dict], source: str) -> list[dict]:
+    """Update in-memory cache and metadata."""
+    global _gp_cache_data, _gp_cache_ts, _active_gp_source, _gp_cache_info
+    now = time.time()
+    _gp_cache_data = records
+    _gp_cache_ts = now
+    _active_gp_source = source
+    _gp_cache_info = {
+        "age_seconds": 0,
+        "record_count": len(records),
+        "last_fetch_source": source,
+        "last_fetch_ts": now,
+    }
+    return records
+
+
 def fetch_gp_data() -> list[dict]:
     """
-    Return GP records from CelesTrak with stale-while-revalidate caching.
-
-    Behaviour by error type
-    ───────────────────────
-    • 403 / 429 (rate-limit)  – log a warning, return stale cache if
-                                 available, otherwise raise so the API
-                                 returns a clear 500 to the operator.
-    • Transient network error – retry up to _FETCH_MAX_RETRIES times
-                                 with exponential back-off, then fall
-                                 back to stale cache if available.
-    • Cache fresh (< 3 h old) – return cached data without any request.
+    Fetch GP records with priority: Space-Track → CelesTrak → Local fallback.
+    Controlled by GP_SOURCE env var: "auto" | "space-track" | "celestrak" | "local"
     """
-    global _gp_cache_data, _gp_cache_ts
+    global _gp_cache_data, _gp_cache_ts, _gp_cache_info
 
-    now = time.time()
-    cache_age = now - _gp_cache_ts
+    sources = _resolve_source_order(_GP_SOURCE)
 
-    # Cache is still fresh — return immediately
-    if _gp_cache_data is not None and cache_age < _GP_CACHE_TTL:
-        logger.debug("Returning cached GP data (age %.0f s).", cache_age)
+    for src in sources:
+        records: Optional[list[dict]] = None
+
+        try:
+            if src == "space-track":
+                records = _fetch_space_track()
+            elif src == "celestrak":
+                records = _fetch_celestrak()
+            elif src == "local":
+                records = _load_local_fallback()
+        except Exception as exc:
+            logger.warning("Source %s raised exception: %s", src, exc)
+            records = None
+
+        if records:
+            logger.info("Source %s succeeded with %d records", src, len(records))
+            _maybe_write_fallback(records)
+            return _update_cache(records, src)
+        else:
+            logger.debug("Source %s returned no records", src)
+
+    # All sources failed — return stale cache if available
+    if _gp_cache_data is not None:
+        cache_age = time.time() - _gp_cache_ts
+        logger.warning(
+            "All sources failed; returning stale cache (%d records, age %.0f s, last source: %s)",
+            len(_gp_cache_data), cache_age, _active_gp_source
+        )
+        _gp_cache_info["age_seconds"] = cache_age
         return _gp_cache_data
 
-    logger.info("Fetching fresh TLE data from CelesTrak …")
-    try:
-        records = _do_fetch()
-        _gp_cache_data = records
-        _gp_cache_ts   = now
-        return records
+    raise RuntimeError("No GP data source available and no cached data")
 
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "?"
-        if status in (403, 429):
-            logger.warning(
-                "CelesTrak returned %s (rate-limited). "
-                "Serving stale cache (%d records, age %.0f s)." if _gp_cache_data
-                else "CelesTrak returned %s (rate-limited) and no cached data available.",
-                status,
-                *(
-                    (len(_gp_cache_data), cache_age)
-                    if _gp_cache_data else ()
-                ),
-            )
-            if _gp_cache_data:
-                return _gp_cache_data
-        raise
 
-    except Exception as exc:
-        if _gp_cache_data:
-            logger.warning(
-                "CelesTrak fetch failed (%s). "
-                "Serving stale cache (%d records, age %.0f s).",
-                exc, len(_gp_cache_data), cache_age,
-            )
-            return _gp_cache_data
-        raise
+def get_active_gp_source() -> str:
+    """Return the source that last successfully provided data."""
+    return _active_gp_source
+
+
+def get_gp_cache_info() -> dict:
+    """Return cache metadata for health endpoint."""
+    info = dict(_gp_cache_info)
+    if _gp_cache_ts:
+        info["age_seconds"] = time.time() - _gp_cache_ts
+    return info
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -504,18 +573,40 @@ def compute_pc(
 # ──────────────────────────────────────────────────────────────────────────────
 def run_conjunction_scan(max_objects: int = 500) -> List[dict]:
     """
-    Full pipeline: fetch → filter → propagate → TCA → Pc.
+    Full pipeline: fetch → LEO filter → TCA → Pc.
     Returns a list of conjunction dicts sorted by descending Pc.
-    Caps the catalog at `max_objects` (highest-risk altitude band first)
-    to keep runtime manageable for a demo.
+
+    Pipeline:
+      1. Fetch full GP catalog (Space-Track → local fallback).
+      2. Propagate ALL records to get current ECI state and altitude.
+      3. Filter to 300–1 200 km LEO band (highest conjunction density).
+      4. Sort by altitude so spatially adjacent objects cluster together.
+      5. Cap to max_objects after the altitude filter.
+      6. KD-Tree pre-filter → TCA bisection → Pc integration.
+
+    Previous behaviour sliced gp_records[:max_objects] from the raw catalog
+    which distributed objects across all shells, giving the KD-Tree 0 pairs.
     """
     t0 = time.time()
     gp_records = fetch_gp_data()
 
-    # Trim to max_objects nearest LEO objects for demo feasibility
-    gp_records = gp_records[:max_objects]
+    # Propagate full catalog to obtain real ECI altitudes at t0
+    all_sats = build_satellite_list(gp_records, t0)
 
-    sats = build_satellite_list(gp_records, t0)
+    # Filter to active LEO band where conjunction risk is highest
+    leo_sats = [s for s in all_sats if 300.0 <= s.altitude_km <= 1200.0]
+
+    # Sort by altitude so the KD-Tree receives spatially coherent input
+    leo_sats.sort(key=lambda s: s.altitude_km)
+
+    # Cap to max_objects after the altitude filter
+    sats = leo_sats[:max_objects]
+
+    logger.info(
+        "LEO filter: %d/%d objects in 300–1200 km band, using %d for scan.",
+        len(leo_sats), len(all_sats), len(sats),
+    )
+
     pairs = find_candidate_pairs(sats, delta_alt_km=100.0)
 
     results: List[dict] = []
