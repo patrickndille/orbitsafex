@@ -49,9 +49,9 @@ PC_THRESHOLD = 1e-6             # report only conjunctions above this Pc
 logger = logging.getLogger("orbital_math")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CelesTrak data fetch (15-minute cache)
+# CelesTrak data fetch (3-hour cache — respects the 2-hour update cycle)
 # ──────────────────────────────────────────────────────────────────────────────
-_tle_cache: TTLCache = TTLCache(maxsize=1, ttl=900)  # 15 min
+_tle_cache: TTLCache = TTLCache(maxsize=1, ttl=10800)  # 3 hours (CelesTrak updates every 2 h)
 
 _HEADERS = {
     "User-Agent": (
