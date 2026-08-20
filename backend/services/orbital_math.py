@@ -36,8 +36,10 @@ XP3O15 = 1440.0 / (2.0 * math.pi)   # converts rev/day → rad/min
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
+# CelesTrak OMM JSON format — supports 6-digit+ catalog numbers and all OMM
+# fields. FORMAT=JSON (uppercase) selects the modern OMM/JSON schema.
 CELESTRAK_URL = (
-    "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=json"
+    "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=JSON"
 )
 EARTH_RADIUS_KM = 6371.0        # mean Earth radius
 ALT_BIN_WIDTH_KM = 50.0         # altitude bin for spatial pre-filter
@@ -221,9 +223,56 @@ _SGP4_ERRORS = {
 }
 
 
+# ── OMM JSON → sgp4init field map ───────────────────────────────────────────
+# CelesTrak's OMM JSON schema uses CCSDS OMM field names.  Map each OMM key
+# to the legacy GP key so _build_satrec works with both response formats.
+#
+# OMM field          Legacy GP field    Notes
+# ─────────────────────────────────────────────────────────────────
+# CCSDS_OMM_VERS     —                  format discriminator
+# NORAD_CAT_ID       NORAD_CAT_ID       same in both
+# OBJECT_NAME        OBJECT_NAME        same in both
+# EPOCH              EPOCH              same in both
+# MEAN_MOTION_DOT    NDOT               rev/day²
+# MEAN_MOTION_DDOT   NDDOT              rev/day³
+# BSTAR              BSTAR              same in both
+# INCLINATION        INCLO              degrees
+# RA_OF_ASC_NODE     RAAN               degrees
+# ECCENTRICITY       ECCO               dimensionless
+# ARG_OF_PERICENTER  ARGPO              degrees
+# MEAN_ANOMALY       MO                 degrees
+# MEAN_MOTION        NO_KOZAI           rev/day
+# ─────────────────────────────────────────────────────────────────
+_OMM_TO_GP: dict[str, str] = {
+    "MEAN_MOTION_DOT":  "NDOT",
+    "MEAN_MOTION_DDOT": "NDDOT",
+    "INCLINATION":      "INCLO",
+    "RA_OF_ASC_NODE":   "RAAN",
+    "ECCENTRICITY":     "ECCO",
+    "ARG_OF_PERICENTER":"ARGPO",
+    "MEAN_ANOMALY":     "MO",
+    "MEAN_MOTION":      "NO_KOZAI",
+}
+
+
+def _normalise_gp(gp: dict) -> dict:
+    """
+    Return a copy of *gp* with OMM field names aliased to legacy GP names.
+    Records that already use legacy names pass through unchanged, so the
+    function is safe to call on both FORMAT=json and FORMAT=JSON responses.
+    """
+    out = dict(gp)
+    for omm_key, gp_key in _OMM_TO_GP.items():
+        if omm_key in out and gp_key not in out:
+            out[gp_key] = out[omm_key]
+    return out
+
+
 def _build_satrec(gp: dict) -> Optional[Satrec]:
-    """Construct a Satrec object directly from CelesTrak GP JSON parameters."""
+    """Construct a Satrec object directly from CelesTrak GP/OMM JSON parameters."""
     try:
+        gp = _normalise_gp(gp)
+
         # Parse ISO epoch string into Julian Date components
         epoch_str = gp["EPOCH"].replace("Z", "")
         ep_dt = datetime.datetime.fromisoformat(epoch_str)
