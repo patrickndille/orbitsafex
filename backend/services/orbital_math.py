@@ -26,7 +26,11 @@ import requests
 from cachetools import TTLCache, cached
 from scipy.integrate import dblquad
 from scipy.spatial import KDTree
-from sgp4.api import Satrec, jday
+from sgp4.api import Satrec, WGS72, jday
+
+# Unit conversion constants
+DEG2RAD = math.pi / 180.0
+XP3O15 = 1440.0 / (2.0 * math.pi)   # converts rev/day → rad/min
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -101,67 +105,32 @@ _SGP4_ERRORS = {
 
 
 def _build_satrec(gp: dict) -> Optional[Satrec]:
-    """
-    Construct a Satrec from a CelesTrak GP JSON record by building
-    standard TLE Line 1 / Line 2 strings and parsing via
-    ``Satrec.twoline2rv()``.
-
-    This is the canonical, fully-tested parsing path and avoids any
-    manual unit-conversion errors in ``sgp4init``.
-    """
+    """Construct a Satrec object directly from CelesTrak GP JSON parameters."""
     try:
-        norad_id   = int(gp["NORAD_CAT_ID"])
-        # ── Line 1 ──────────────────────────────────────────────────────
-        # Field widths are fixed by the TLE standard (columns 1–69).
-        # We only need a syntactically valid line; twoline2rv() uses
-        # the numeric fields directly and ignores the checksum on parse.
-        epoch_str  = gp["EPOCH"]           # e.g. "2024-316.82345678"
-        # CelesTrak epochs are ISO-8601: "2024-11-12T00:00:00.000000"
-        # Convert to TLE epoch format: YYDDD.DDDDDDDD
-        ep_dt = datetime.datetime.fromisoformat(epoch_str.replace("Z", ""))
-        day_of_year = ep_dt.timetuple().tm_yday
-        frac_day = (
-            ep_dt.hour * 3600 + ep_dt.minute * 60 + ep_dt.second + ep_dt.microsecond / 1e6
-        ) / 86400.0
-        # TLE epoch: YYDDD.DDDDDDDD  (8 decimal places of fractional day)
-        epoch_tle = f"{ep_dt.year % 100:02d}{day_of_year:03d}{frac_day:09.8f}"
-
-        bstar  = gp["BSTAR"]
-        ndot   = gp["NDOT"]
-        nddot  = gp["NDDOT"]
-
-        # Format BSTAR in TLE exponential notation  ±.XXXXXE±Y
-        def _tle_exp(val: float) -> str:
-            if val == 0.0:
-                return " 00000-0"
-            sign = " " if val >= 0 else "-"
-            val = abs(val)
-            exp = math.floor(math.log10(val)) + 1
-            mantissa = val / (10 ** exp)
-            mantissa_str = f"{mantissa:.5f}".lstrip("0").replace(".", "")
-            return f"{sign}{mantissa_str}{exp:+d}".replace("+", "+").replace("--", "-")
-
-        # Build minimal but syntactically valid lines (checksum = 0 is accepted)
-        line1 = (
-            f"1 {norad_id:05d}U {epoch_tle:14s} "
-            f"{ndot:10.8f} {_tle_exp(nddot):8s} {_tle_exp(bstar):8s} 0  0000"
-        )
-        inclo  = gp["INCLO"]    # degrees
-        raan   = gp["RAAN"]     # degrees
-        ecco   = gp["ECCO"]     # dimensionless  0–1
-        argpo  = gp["ARGPO"]    # degrees
-        mo     = gp["MO"]       # degrees (mean anomaly)
-        no_kozai = gp["NO_KOZAI"]  # rev/day
-
-        # ECCO in TLE: 7-digit integer representing the decimal fraction (no leading "0.")
-        ecco_str = f"{ecco:.7f}"[2:]   # strip "0."
-
-        line2 = (
-            f"2 {norad_id:05d} {inclo:8.4f} {raan:8.4f} {ecco_str} "
-            f"{argpo:8.4f} {mo:8.4f} {no_kozai:11.8f}    00"
+        # Parse ISO epoch string into Julian Date components
+        epoch_str = gp["EPOCH"].replace("Z", "")
+        ep_dt = datetime.datetime.fromisoformat(epoch_str)
+        jd, fr = jday(
+            ep_dt.year, ep_dt.month, ep_dt.day,
+            ep_dt.hour, ep_dt.minute, ep_dt.second + ep_dt.microsecond / 1e6
         )
 
-        sat = Satrec.twoline2rv(line1, line2)
+        sat = Satrec()
+        sat.sgp4init(
+            WGS72,                                # WGS72 gravity model object
+            "i",                                  # improved SGP4 mode
+            int(gp["NORAD_CAT_ID"]),
+            jd + fr - 2433281.5,                  # epoch: days since 1949-12-31 00:00 UT
+            float(gp["BSTAR"]),
+            float(gp["NDOT"]),
+            float(gp["NDDOT"]),
+            float(gp["ECCO"]),
+            float(gp["ARGPO"]) * DEG2RAD,         # rad
+            float(gp["INCLO"]) * DEG2RAD,         # rad
+            float(gp["MO"]) * DEG2RAD,            # rad
+            float(gp["NO_KOZAI"]) / XP3O15,       # rad/min
+            float(gp["RAAN"]) * DEG2RAD,          # rad
+        )
         return sat
 
     except Exception as exc:
