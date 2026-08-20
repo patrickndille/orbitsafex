@@ -402,11 +402,13 @@ def find_tca(
     t0: float,
     window_h: float = PROPAGATION_WINDOW_H,
     step_s: float = PROPAGATION_STEP_S,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Walk the propagation window in `step_s` increments; return
-    (tca_unix, miss_distance_km, rel_velocity_kms) at the minimum range epoch.
-    Refines the minimum with a ±step_s binary-narrowing pass.
+    (tca_unix, miss_distance_km, rel_velocity_kms, pos_a_km, pos_b_km)
+    at the minimum range epoch.  pos_a/b are ECI vectors (km) at TCA,
+    or None if propagation failed.  Refines the minimum with a ±step_s
+    binary-narrowing pass.
     """
     best_t = t0
     best_dist = float("inf")
@@ -448,7 +450,7 @@ def find_tca(
     if ra_f is not None and va_f is not None and rb_f is not None and vb_f is not None:
         best_dist = float(np.linalg.norm(ra_f - rb_f))
         best_rv = float(np.linalg.norm(va_f - vb_f))
-    return tca, best_dist, best_rv
+    return tca, best_dist, best_rv, ra_f, rb_f
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -503,12 +505,30 @@ def compute_pc(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ECI → geographic conversion
+# ──────────────────────────────────────────────────────────────────────────────
+def _eci_to_geo(pos_km: np.ndarray) -> Tuple[float, float, float]:
+    """Convert an ECI position vector (km) to (latitude_deg, longitude_deg, altitude_km).
+
+    Uses a simplified spherical-Earth model (no GMST rotation for epoch
+    alignment — positions are used only for globe visualisation, not
+    precision geodesy).
+    """
+    x, y, z = float(pos_km[0]), float(pos_km[1]), float(pos_km[2])
+    r = math.sqrt(x * x + y * y + z * z)
+    lat = math.degrees(math.asin(z / r))
+    lon = math.degrees(math.atan2(y, x))
+    alt = r - EARTH_RADIUS_KM
+    return round(lat, 4), round(lon, 4), round(alt, 4)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ──────────────────────────────────────────────────────────────────────────────
 def run_conjunction_scan(max_objects: int = 500) -> List[dict]:
     """
     Full pipeline: fetch → LEO filter → TCA → Pc.
-    Returns a list of conjunction dicts sorted by descending Pc.
+    Returns a list of conjunction dicts sorted by descending Pc (MONITOR last).
 
     Pipeline:
       1. Fetch full GP catalog (Space-Track → local fallback).
@@ -517,9 +537,12 @@ def run_conjunction_scan(max_objects: int = 500) -> List[dict]:
       4. Sort by altitude so spatially adjacent objects cluster together.
       5. Cap to max_objects after the altitude filter.
       6. KD-Tree pre-filter → TCA bisection → Pc integration.
+      7. Pairs with Pc ≥ 1e-6 are tiered ELEVATED/HIGH/CRITICAL.
+         Pairs with Pc < 1e-6 (but within 10–100 km at TCA) are retained
+         as MONITOR events with pc_value=0 so the dashboard can count them.
 
-    Previous behaviour sliced gp_records[:max_objects] from the raw catalog
-    which distributed objects across all shells, giving the KD-Tree 0 pairs.
+    Each event also carries primary_lat/lon/alt and secondary_lat/lon/alt
+    computed from the ECI position vectors at TCA for globe visualisation.
     """
     t0 = time.time()
     gp_records = fetch_gp_data()
@@ -543,14 +566,25 @@ def run_conjunction_scan(max_objects: int = 500) -> List[dict]:
 
     pairs = find_candidate_pairs(sats, delta_alt_km=100.0)
 
-    results: List[dict] = []
+    tiered: List[dict] = []   # Pc >= PC_THRESHOLD
+    monitor: List[dict] = []  # Pc < PC_THRESHOLD but within 10–100 km
+
     for i, j in pairs:
         a, b = sats[i], sats[j]
-        tca, miss_km, rel_v = find_tca(a, b, t0)
+        tca, miss_km, rel_v, ra_tca, rb_tca = find_tca(a, b, t0)
         pc = compute_pc(miss_km, rel_v)
-        if pc < PC_THRESHOLD:
-            continue
-        results.append({
+
+        # Build geographic positions from ECI vectors at TCA
+        if ra_tca is not None:
+            p_lat, p_lon, p_alt = _eci_to_geo(ra_tca)
+        else:
+            p_lat, p_lon, p_alt = 0.0, 0.0, 400.0
+        if rb_tca is not None:
+            s_lat, s_lon, s_alt = _eci_to_geo(rb_tca)
+        else:
+            s_lat, s_lon, s_alt = 0.0, 0.0, 400.0
+
+        event = {
             "norad_id": a.norad_id,
             "sat_name": a.name,
             "secondary_norad_id": b.norad_id,
@@ -558,11 +592,29 @@ def run_conjunction_scan(max_objects: int = 500) -> List[dict]:
             "tca_iso": _unix_to_iso(tca),
             "miss_distance_km": round(miss_km, 4),
             "relative_velocity_kms": round(rel_v, 4),
-            "pc_value": float(f"{pc:.6e}"),
-        })
+            "pc_value": float(f"{pc:.6e}") if pc >= PC_THRESHOLD else 0.0,
+            "primary_lat": p_lat,
+            "primary_lon": p_lon,
+            "primary_alt_km": p_alt,
+            "secondary_lat": s_lat,
+            "secondary_lon": s_lon,
+            "secondary_alt_km": s_alt,
+        }
 
-    results.sort(key=lambda r: r["pc_value"], reverse=True)
-    logger.info("Scan complete: %d conjunction events above Pc threshold.", len(results))
+        if pc >= PC_THRESHOLD:
+            tiered.append(event)
+        elif 10.0 <= miss_km <= 100.0:
+            # Within close-approach band but below statistical threshold —
+            # retain as MONITOR so operators can see the tracked proximity.
+            monitor.append(event)
+
+    tiered.sort(key=lambda r: r["pc_value"], reverse=True)
+    results = tiered + monitor  # MONITOR always appended after risk-sorted events
+
+    logger.info(
+        "Scan complete: %d tiered events (Pc ≥ 1e-6) + %d MONITOR events.",
+        len(tiered), len(monitor),
+    )
     return results
 
 

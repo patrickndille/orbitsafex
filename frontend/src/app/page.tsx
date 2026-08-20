@@ -220,7 +220,7 @@ export default function DashboardPage() {
             <span className="text-xs text-slate-600">Drag to rotate · Auto-spin enabled</span>
           </div>
           <div className="flex-1 min-h-[380px] xl:min-h-[500px] rounded-xl border border-slate-700/50 overflow-hidden bg-space-900">
-            <GlobeView events={events} selectedId={selectedEvent?.norad_id ?? null} />
+            <GlobeView events={events} selectedEvent={selectedEvent} />
           </div>
 
           {/* Legend */}

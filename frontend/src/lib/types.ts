@@ -8,7 +8,15 @@ export interface ConjunctionEvent {
   tca_iso: string;              // ISO-8601 UTC
   miss_distance_km: number;
   relative_velocity_kms: number;
-  pc_value: number;             // Probability of Collision  0–1
+  pc_value: number;             // Probability of Collision 0–1; 0 = MONITOR sentinel
+
+  // Geographic positions at TCA (from ECI vectors) — used by GlobeView
+  primary_lat?: number;
+  primary_lon?: number;
+  primary_alt_km?: number;
+  secondary_lat?: number;
+  secondary_lon?: number;
+  secondary_alt_km?: number;
 }
 
 export interface ScanResponse {
