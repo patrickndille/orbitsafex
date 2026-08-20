@@ -53,16 +53,30 @@ logger = logging.getLogger("orbital_math")
 # ──────────────────────────────────────────────────────────────────────────────
 _tle_cache: TTLCache = TTLCache(maxsize=1, ttl=900)  # 15 min
 
+_HEADERS = {"User-Agent": "OrbitSafeAI/1.0"}
+
 
 @cached(_tle_cache)
 def fetch_gp_data() -> list[dict]:
-    """Return raw GP records from CelesTrak (cached 15 min)."""
+    """
+    Return raw GP records from CelesTrak (cached 15 min).
+
+    A User-Agent header is required; CelesTrak returns 403 for
+    bare requests with no User-Agent.  On any error the cache key
+    is evicted so the next call retries instead of serving a cached
+    failure.
+    """
     logger.info("Fetching fresh TLE data from CelesTrak …")
-    resp = requests.get(CELESTRAK_URL, timeout=30)
-    resp.raise_for_status()
-    records = resp.json()
-    logger.info("Fetched %d GP records.", len(records))
-    return records
+    try:
+        resp = requests.get(CELESTRAK_URL, headers=_HEADERS, timeout=30)
+        resp.raise_for_status()
+        records = resp.json()
+        logger.info("Fetched %d GP records.", len(records))
+        return records
+    except Exception:
+        # Evict the (empty) cache entry so the next request retries.
+        _tle_cache.clear()
+        raise
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -248,7 +262,7 @@ def find_tca(
     while t <= t_end:
         ra, va = _propagate(sat_a.satrec, t)
         rb, vb = _propagate(sat_b.satrec, t)
-        if ra is None or rb is None:
+        if ra is None or va is None or rb is None or vb is None:
             t += step_s
             continue
         dist = float(np.linalg.norm(ra - rb))
@@ -276,7 +290,7 @@ def find_tca(
     tca = (lo + hi) / 2
     ra_f, va_f = _propagate(sat_a.satrec, tca)
     rb_f, vb_f = _propagate(sat_b.satrec, tca)
-    if ra_f is not None and rb_f is not None:
+    if ra_f is not None and va_f is not None and rb_f is not None and vb_f is not None:
         best_dist = float(np.linalg.norm(ra_f - rb_f))
         best_rv = float(np.linalg.norm(va_f - vb_f))
     return tca, best_dist, best_rv
