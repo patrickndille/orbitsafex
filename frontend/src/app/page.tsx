@@ -76,7 +76,11 @@ export default function DashboardPage() {
   const [lastScan, setLastScan] = useState<Date | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [selectedEvent, setSelectedEvent] = useState<ConjunctionEvent | null>(null);
+  const [hoveredEvent, setHoveredEvent]   = useState<ConjunctionEvent | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+
+  // Globe always shows the hovered row first; falls back to the open triage event
+  const globeEvent = hoveredEvent ?? selectedEvent;
 
   const runScan = useCallback(async () => {
     setLoading(true);
@@ -220,7 +224,7 @@ export default function DashboardPage() {
             <span className="text-xs text-slate-600">Drag to rotate · Auto-spin enabled</span>
           </div>
           <div className="flex-1 min-h-[380px] xl:min-h-[500px] rounded-xl border border-slate-700/50 overflow-hidden bg-space-900">
-            <GlobeView events={events} selectedEvent={selectedEvent} />
+            <GlobeView events={events} selectedEvent={globeEvent} />
           </div>
 
           {/* Legend */}
@@ -254,6 +258,7 @@ export default function DashboardPage() {
               events={events}
               loading={loading}
               onSelectEvent={setSelectedEvent}
+              onHoverEvent={setHoveredEvent}
             />
           </div>
         </div>

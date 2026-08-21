@@ -1,24 +1,20 @@
 "use client";
 
 /**
- * GlobeView.tsx
- * Three.js 3-D Earth globe.
+ * GlobeView.tsx — Three.js 3-D Earth globe
  *
- * Renders:
- *   • Procedural Earth sphere with specular/emissive shading
- *   • Atmosphere glow shell
- *   • Satellite position dots (representative background traffic)
- *   • Conjunction event nodes — colour-coded by risk tier, pulsing on CRITICAL/HIGH
- *   • Orbit-arc lines for flagged events
+ * Architecture: everything (Earth, nodes, overlay) is added directly to
+ * `group` which is the single rotating child of the scene.  selGroup is
+ * also a child of `group` so the overlay rotates with the globe.
  *
- * When a conjunction event is selected:
- *   • Pulsing ring (torus) + wireframe halo sphere around both the primary
- *     and secondary object at their computed TCA lat/lon/alt
- *   • Bright red great-circle arc connecting the two targets
- *   • Camera group smoothly rotates to face the midpoint of the pair
- *
- * The component is dynamic-import only (no SSR) because Three.js
- * uses browser APIs.
+ * Selected-conjunction overlay (built by buildOverlay):
+ *   Per object (primary + secondary):
+ *     • White core sphere
+ *     • Coloured wireframe halo (breathing opacity)
+ *     • Torus ring oriented radially outward (pulsing scale)
+ *   Connector:
+ *     • Bright red great-circle arc (80 segments)
+ *     • White midpoint dot
  */
 
 import { useEffect, useRef } from "react";
@@ -26,16 +22,17 @@ import * as THREE from "three";
 import type { ConjunctionEvent } from "@/lib/types";
 import { getRiskTier } from "@/lib/types";
 
-// ── helpers ─────────────────────────────────────────────────────────────────
-const DEG = Math.PI / 180;
+// ── constants ────────────────────────────────────────────────────────────────
+const DEG        = Math.PI / 180;
+const R_EARTH_KM = 6371;
 
-/** Convert geographic lat/lon (degrees) + altitude (km) → Three.js XYZ.
- *  The globe uses R=1 for Earth surface; altitude scales proportionally. */
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/** lat/lon (deg) + altKm → Three.js XYZ on the scaled globe sphere */
 function geoToVec3(lat: number, lon: number, altKm: number): THREE.Vector3 {
-  // Map real altitude to scene units: LEO ~400 km → r ≈ 1.063
-  const R_EARTH_KM = 6371;
-  const r = 1 + altKm / R_EARTH_KM;
-  const phi = (90 - lat) * DEG;
+  // Exaggerate altitude slightly so LEO nodes are clearly above the surface
+  const r     = 1 + (altKm / R_EARTH_KM) * 0.8 + 0.06;
+  const phi   = (90 - lat)  * DEG;
   const theta = (lon + 180) * DEG;
   return new THREE.Vector3(
     -r * Math.sin(phi) * Math.cos(theta),
@@ -44,28 +41,25 @@ function geoToVec3(lat: number, lon: number, altKm: number): THREE.Vector3 {
   );
 }
 
-/** Deterministic pseudo-random lat/lon from a NORAD ID — fallback only */
+/** Deterministic pseudo-random lat/lon from NORAD ID — positional fallback */
 function noradToLatLon(id: number): [number, number] {
   const seed = id * 0.6180339887;
-  const lat = (((seed * 127.3) % 1) * 160) - 80;
-  const lon = (((seed * 311.7) % 1) * 360) - 180;
-  return [lat, lon];
+  return [
+    (((seed * 127.3) % 1) * 160) - 80,
+    (((seed * 311.7) % 1) * 360) - 180,
+  ];
 }
 
-/** Interpolate n points along the great circle between two unit vectors. */
-function greatCirclePoints(a: THREE.Vector3, b: THREE.Vector3, n: number, r: number): THREE.Vector3[] {
-  const pts: THREE.Vector3[] = [];
+/** 80-segment great-circle arc at radius r between two world-space vectors */
+function greatCircleArc(a: THREE.Vector3, b: THREE.Vector3, r: number): THREE.Vector3[] {
   const ua = a.clone().normalize();
   const ub = b.clone().normalize();
-  for (let i = 0; i <= n; i++) {
-    const t = i / n;
-    const v = ua.clone().lerp(ub, t).normalize().multiplyScalar(r);
-    pts.push(v);
-  }
-  return pts;
+  return Array.from({ length: 81 }, (_, i) =>
+    ua.clone().lerp(ub, i / 80).normalize().multiplyScalar(r)
+  );
 }
 
-// ── Risk colours ─────────────────────────────────────────────────────────────
+// ── risk colours ─────────────────────────────────────────────────────────────
 const RISK_COLOUR: Record<string, number> = {
   CRITICAL: 0xef4444,
   HIGH:     0xf97316,
@@ -73,273 +67,278 @@ const RISK_COLOUR: Record<string, number> = {
   MONITOR:  0x22c55e,
 };
 
-// ── Props ────────────────────────────────────────────────────────────────────
+// ── props ─────────────────────────────────────────────────────────────────────
 interface GlobeViewProps {
   events: ConjunctionEvent[];
   selectedEvent?: ConjunctionEvent | null;
 }
 
-// ── Component ────────────────────────────────────────────────────────────────
+// ── component ────────────────────────────────────────────────────────────────
 export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
-  const mountRef  = useRef<HTMLDivElement>(null);
+  const mountRef    = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const frameRef  = useRef<number>(0);
+  const frameRef    = useRef<number>(0);
 
   useEffect(() => {
     if (!mountRef.current) return;
     const container = mountRef.current;
-    const W = container.clientWidth;
-    const H = container.clientHeight;
+    const W = container.clientWidth  || 600;
+    const H = container.clientHeight || 400;
 
-    // ── Scene ──────────────────────────────────────────────────────────────
+    // ── scene / camera / renderer ─────────────────────────────────────────
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x020712);
 
-    // ── Camera ────────────────────────────────────────────────────────────
     const camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 1000);
     camera.position.set(0, 0, 3.2);
 
-    // ── Renderer ──────────────────────────────────────────────────────────
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(W, H);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // ── Lights ────────────────────────────────────────────────────────────
+    // ── lights ────────────────────────────────────────────────────────────
     const sunLight = new THREE.DirectionalLight(0xffffff, 2.2);
     sunLight.position.set(5, 3, 5);
     scene.add(sunLight);
     scene.add(new THREE.AmbientLight(0x1a2a4a, 1.2));
 
-    // ── Stars ─────────────────────────────────────────────────────────────
-    const starGeo = new THREE.BufferGeometry();
+    // ── single rotation group (the globe + all overlays live here) ────────
+    const group = new THREE.Group();
+    scene.add(group);
+
+    // ── stars ─────────────────────────────────────────────────────────────
     const starVerts: number[] = [];
     for (let i = 0; i < 6000; i++) {
-      const r = 80 + Math.random() * 120;
-      const theta = Math.random() * Math.PI * 2;
-      const phi = Math.acos(2 * Math.random() - 1);
+      const r  = 80 + Math.random() * 120;
+      const th = Math.random() * Math.PI * 2;
+      const ph = Math.acos(2 * Math.random() - 1);
       starVerts.push(
-        r * Math.sin(phi) * Math.cos(theta),
-        r * Math.cos(phi),
-        r * Math.sin(phi) * Math.sin(theta)
+        r * Math.sin(ph) * Math.cos(th),
+        r * Math.cos(ph),
+        r * Math.sin(ph) * Math.sin(th)
       );
     }
+    const starGeo = new THREE.BufferGeometry();
     starGeo.setAttribute("position", new THREE.Float32BufferAttribute(starVerts, 3));
-    scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 0.18 })));
+    group.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 0.18 })));
 
-    // ── Earth ─────────────────────────────────────────────────────────────
-    const earthGeo = new THREE.SphereGeometry(1, 64, 64);
-    const earthMat = new THREE.MeshPhongMaterial({
-      color: 0x1a4fa8,
-      emissive: 0x0a1f50,
-      specular: 0x3a7bd5,
-      shininess: 60,
-    });
-    const earth = new THREE.Mesh(earthGeo, earthMat);
-    scene.add(earth);
+    // ── Earth sphere ──────────────────────────────────────────────────────
+    group.add(new THREE.Mesh(
+      new THREE.SphereGeometry(1, 64, 64),
+      new THREE.MeshPhongMaterial({
+        color: 0x1a4fa8, emissive: 0x0a1f50,
+        specular: 0x3a7bd5, shininess: 60,
+      })
+    ));
 
-    // land-mass approximation
-    const continentMat = new THREE.MeshPhongMaterial({
-      color: 0x2d6a2d,
-      emissive: 0x0f2b0f,
-      shininess: 10,
-    });
-    const continents: [number, number, number, number][] = [
-      [40, -100, 50, 65],   // North America
-      [-15, -55, 45, 45],   // South America
-      [10, 20, 60, 40],     // Africa
-      [50, 20, 40, 60],     // Europe/W. Asia
-      [30, 80, 40, 60],     // Asia
-      [-25, 135, 30, 30],   // Australia
-    ];
-    continents.forEach(([lat, lon, latS, lonS]) => {
-      const geo = new THREE.SphereGeometry(1.001, 8, 8,
-        (lon * DEG) + Math.PI, lonS * DEG,
-        (90 - lat - latS / 2) * DEG, latS * DEG
-      );
-      scene.add(new THREE.Mesh(geo, continentMat));
+    // continent patches
+    const cMat = new THREE.MeshPhongMaterial({ color: 0x2d6a2d, emissive: 0x0f2b0f, shininess: 10 });
+    ([ [40,-100,50,65],[-15,-55,45,45],[10,20,60,40],[50,20,40,60],[30,80,40,60],[-25,135,30,30] ] as
+      [number,number,number,number][]).forEach(([lat, lon, latS, lonS]) => {
+      group.add(new THREE.Mesh(
+        new THREE.SphereGeometry(1.001, 8, 8,
+          (lon * DEG) + Math.PI, lonS * DEG,
+          (90 - lat - latS / 2) * DEG, latS * DEG),
+        cMat
+      ));
     });
 
-    // ── Atmosphere shell ──────────────────────────────────────────────────
-    const atmGeo = new THREE.SphereGeometry(1.06, 32, 32);
-    const atmMat = new THREE.MeshPhongMaterial({
-      color: 0x4488cc,
-      transparent: true,
-      opacity: 0.12,
-      side: THREE.FrontSide,
-      depthWrite: false,
-    });
-    scene.add(new THREE.Mesh(atmGeo, atmMat));
+    // atmosphere
+    group.add(new THREE.Mesh(
+      new THREE.SphereGeometry(1.06, 32, 32),
+      new THREE.MeshPhongMaterial({
+        color: 0x4488cc, transparent: true, opacity: 0.12,
+        side: THREE.FrontSide, depthWrite: false,
+      })
+    ));
 
-    // ── LEO reference ring ────────────────────────────────────────────────
-    const leoRingGeo = new THREE.TorusGeometry(1.18, 0.003, 4, 120);
-    const leoRingMat = new THREE.MeshBasicMaterial({ color: 0x334466, opacity: 0.4, transparent: true });
-    const leoRing = new THREE.Mesh(leoRingGeo, leoRingMat);
+    // LEO reference ring
+    const leoRing = new THREE.Mesh(
+      new THREE.TorusGeometry(1.18, 0.003, 4, 120),
+      new THREE.MeshBasicMaterial({ color: 0x334466, transparent: true, opacity: 0.4 })
+    );
     leoRing.rotation.x = Math.PI / 2;
-    scene.add(leoRing);
+    group.add(leoRing);
 
-    // ── Background satellite dots ─────────────────────────────────────────
-    const satDotGeo = new THREE.SphereGeometry(0.008, 6, 6);
-    const satDotMat = new THREE.MeshBasicMaterial({ color: 0x94a3b8 });
+    // ── background satellite dots ─────────────────────────────────────────
+    const satGeo = new THREE.SphereGeometry(0.008, 6, 6);
+    const satMat = new THREE.MeshBasicMaterial({ color: 0x94a3b8 });
     for (let i = 0; i < 60; i++) {
-      const lat = Math.random() * 160 - 80;
-      const lon = Math.random() * 360 - 180;
-      const dot = new THREE.Mesh(satDotGeo, satDotMat);
-      dot.position.copy(geoToVec3(lat, lon, 400));
-      scene.add(dot);
+      const dot = new THREE.Mesh(satGeo, satMat);
+      dot.position.copy(geoToVec3(Math.random() * 160 - 80, Math.random() * 360 - 180, 400));
+      group.add(dot);
     }
 
-    // ── Conjunction event nodes ───────────────────────────────────────────
+    // ── conjunction event nodes (primary + secondary of every event) ──────
+    // Both objects in a conjunction pair are plotted so the secondary is always
+    // visible on the globe even when it isn't the primary of another event.
     const eventNodes: THREE.Mesh[] = [];
     events.slice(0, 60).forEach((evt) => {
-      const tier  = getRiskTier(evt.pc_value);
+      const tier   = getRiskTier(evt.pc_value);
       const colour = RISK_COLOUR[tier] ?? 0xffffff;
-      const lat = evt.primary_lat  ?? noradToLatLon(evt.norad_id)[0];
-      const lon = evt.primary_lon  ?? noradToLatLon(evt.norad_id)[1];
-      const alt = evt.primary_alt_km ?? 400;
 
-      const nodeGeo = new THREE.SphereGeometry(0.018, 8, 8);
-      const nodeMat = new THREE.MeshBasicMaterial({ color: colour });
-      const node    = new THREE.Mesh(nodeGeo, nodeMat);
-      node.position.copy(geoToVec3(lat, lon, alt));
-      node.userData = { id: evt.norad_id, basePc: evt.pc_value, phase: Math.random() * Math.PI * 2 };
-      scene.add(node);
-      eventNodes.push(node);
+      // ── Primary node ──
+      const pLat = evt.primary_lat    ?? noradToLatLon(evt.norad_id)[0];
+      const pLon = evt.primary_lon    ?? noradToLatLon(evt.norad_id)[1];
+      const pAlt = evt.primary_alt_km ?? 400;
 
-      // orbit arc suggestion
-      const arcPoints: THREE.Vector3[] = [];
+      const primaryNode = new THREE.Mesh(
+        new THREE.SphereGeometry(0.018, 8, 8),
+        new THREE.MeshBasicMaterial({ color: colour })
+      );
+      primaryNode.position.copy(geoToVec3(pLat, pLon, pAlt));
+      primaryNode.userData = { basePc: evt.pc_value, phase: Math.random() * Math.PI * 2 };
+      group.add(primaryNode);
+      eventNodes.push(primaryNode);
+
+      // faint orbit-arc suggestion for primary
+      const arcPts: THREE.Vector3[] = [];
       for (let a = 0; a <= 360; a += 4) {
-        arcPoints.push(geoToVec3(lat * Math.cos(a * DEG * 0.5), lon + a * 0.6, alt));
+        arcPts.push(geoToVec3(pLat * Math.cos(a * DEG * 0.5), pLon + a * 0.6, pAlt));
       }
-      const arcGeo = new THREE.BufferGeometry().setFromPoints(arcPoints);
-      scene.add(new THREE.Line(arcGeo, new THREE.LineBasicMaterial({
-        color: colour, transparent: true, opacity: 0.25,
-      })));
+      group.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(arcPts),
+        new THREE.LineBasicMaterial({ color: colour, transparent: true, opacity: 0.22 })
+      ));
+
+      // ── Secondary node (smaller diamond-ish sphere, same tier colour) ──
+      const sLat = evt.secondary_lat    ?? noradToLatLon(evt.secondary_norad_id)[0];
+      const sLon = evt.secondary_lon    ?? noradToLatLon(evt.secondary_norad_id)[1];
+      const sAlt = evt.secondary_alt_km ?? 400;
+
+      const secondaryNode = new THREE.Mesh(
+        new THREE.SphereGeometry(0.013, 8, 8),           // smaller than primary
+        new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: 0.75 })
+      );
+      secondaryNode.position.copy(geoToVec3(sLat, sLon, sAlt));
+      secondaryNode.userData = { basePc: evt.pc_value, phase: Math.random() * Math.PI * 2 };
+      group.add(secondaryNode);
+      eventNodes.push(secondaryNode);
     });
 
-    // ── Selected conjunction overlay ──────────────────────────────────────
-    // Objects that need to be removed/updated when selectedEvent changes
+    // ── selected-conjunction overlay ──────────────────────────────────────
+    // selGroup is a child of `group` so it rotates with the globe.
     const selGroup = new THREE.Group();
-    scene.add(selGroup);
+    group.add(selGroup);
 
-    const buildSelectionOverlay = (evt: ConjunctionEvent | null | undefined) => {
-      // Clear previous overlay
-      while (selGroup.children.length) selGroup.remove(selGroup.children[0]);
+    const buildOverlay = (evt: ConjunctionEvent | null | undefined) => {
+      // remove and dispose previous children
+      selGroup.children.slice().forEach((c) => {
+        if ((c as THREE.Mesh).geometry) (c as THREE.Mesh).geometry.dispose();
+        selGroup.remove(c);
+      });
       if (!evt) return;
 
-      const tier   = getRiskTier(evt.pc_value);
-      const colour = RISK_COLOUR[tier] ?? 0xef4444;
+      const tier    = getRiskTier(evt.pc_value);
+      const pColour = RISK_COLOUR[tier] ?? 0xef4444;
+      const sColour = 0xff2222; // secondary always red
 
-      const pLat = evt.primary_lat   ?? noradToLatLon(evt.norad_id)[0];
-      const pLon = evt.primary_lon   ?? noradToLatLon(evt.norad_id)[1];
-      const pAlt = evt.primary_alt_km  ?? 400;
-      const sLat = evt.secondary_lat ?? noradToLatLon(evt.secondary_norad_id)[0];
-      const sLon = evt.secondary_lon ?? noradToLatLon(evt.secondary_norad_id)[1];
+      const pLat = evt.primary_lat      ?? noradToLatLon(evt.norad_id)[0];
+      const pLon = evt.primary_lon      ?? noradToLatLon(evt.norad_id)[1];
+      const pAlt = evt.primary_alt_km   ?? 400;
+      const sLat = evt.secondary_lat    ?? noradToLatLon(evt.secondary_norad_id)[0];
+      const sLon = evt.secondary_lon    ?? noradToLatLon(evt.secondary_norad_id)[1];
       const sAlt = evt.secondary_alt_km ?? 400;
 
       const posA = geoToVec3(pLat, pLon, pAlt);
       const posB = geoToVec3(sLat, sLon, sAlt);
 
-      // Helper: add a pulsing ring + halo sphere at a position
       const addHighlight = (pos: THREE.Vector3, col: number) => {
-        // Outer wireframe sphere (halo)
-        const haloGeo = new THREE.SphereGeometry(0.045, 12, 12);
-        const haloMat = new THREE.MeshBasicMaterial({
-          color: col, wireframe: true, transparent: true, opacity: 0.55,
-        });
-        const halo = new THREE.Mesh(haloGeo, haloMat);
+        // 1. Bright white core
+        const core = new THREE.Mesh(
+          new THREE.SphereGeometry(0.028, 10, 10),
+          new THREE.MeshBasicMaterial({ color: 0xffffff })
+        );
+        core.position.copy(pos);
+        selGroup.add(core);
+
+        // 2. Coloured wireframe halo — breathing opacity via animation
+        const halo = new THREE.Mesh(
+          new THREE.SphereGeometry(0.055, 14, 14),
+          new THREE.MeshBasicMaterial({ color: col, wireframe: true, transparent: true, opacity: 0.7 })
+        );
         halo.position.copy(pos);
         halo.userData.isHalo = true;
         selGroup.add(halo);
 
-        // Equatorial ring (torus lying flat around the node)
-        const ringGeo = new THREE.TorusGeometry(0.055, 0.006, 8, 40);
-        const ringMat = new THREE.MeshBasicMaterial({
-          color: col, transparent: true, opacity: 0.85,
-        });
-        const ring = new THREE.Mesh(ringGeo, ringMat);
+        // 3. Torus ring, oriented outward from Earth — pulsing scale
+        const ring = new THREE.Mesh(
+          new THREE.TorusGeometry(0.068, 0.008, 8, 48),
+          new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.95 })
+        );
         ring.position.copy(pos);
-        // Orient the ring to face outward from Earth centre
         ring.quaternion.setFromUnitVectors(
           new THREE.Vector3(0, 0, 1),
           pos.clone().normalize()
         );
         ring.userData.isPulseRing = true;
         selGroup.add(ring);
-
-        // Bright core dot
-        const coreGeo = new THREE.SphereGeometry(0.024, 8, 8);
-        const coreMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-        const core    = new THREE.Mesh(coreGeo, coreMat);
-        core.position.copy(pos);
-        selGroup.add(core);
       };
 
-      addHighlight(posA, colour);
-      addHighlight(posB, 0xff2222); // secondary always red
+      addHighlight(posA, pColour);
+      addHighlight(posB, sColour);
 
-      // Great-circle arc between the two objects
+      // 4. Bright red great-circle arc
       const arcR   = (posA.length() + posB.length()) / 2;
-      const arcPts = greatCirclePoints(posA, posB, 80, arcR);
-      const arcGeo = new THREE.BufferGeometry().setFromPoints(arcPts);
-      const arcMat = new THREE.LineBasicMaterial({
-        color: 0xff1111,
-        transparent: true,
-        opacity: 0.9,
-        linewidth: 2,          // note: linewidth >1 only on WebGL2 with LineMaterial
-      });
-      selGroup.add(new THREE.Line(arcGeo, arcMat));
+      selGroup.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(greatCircleArc(posA, posB, arcR)),
+        new THREE.LineBasicMaterial({ color: 0xff0000, transparent: true, opacity: 1.0 })
+      ));
 
-      // Dashed mid-point label sphere (bright white, slightly larger)
-      const midPos = posA.clone().lerp(posB, 0.5).normalize().multiplyScalar(arcR);
-      const midGeo = new THREE.SphereGeometry(0.012, 8, 8);
-      const midMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-      const mid    = new THREE.Mesh(midGeo, midMat);
-      mid.position.copy(midPos);
+      // 5. White midpoint dot
+      const mid = new THREE.Mesh(
+        new THREE.SphereGeometry(0.014, 8, 8),
+        new THREE.MeshBasicMaterial({ color: 0xffffff })
+      );
+      mid.position.copy(posA.clone().lerp(posB, 0.5).normalize().multiplyScalar(arcR));
       selGroup.add(mid);
     };
 
-    buildSelectionOverlay(selectedEvent);
+    buildOverlay(selectedEvent);
 
-    // ── Mouse drag rotation ───────────────────────────────────────────────
+    // ── camera snap-to ────────────────────────────────────────────────────
+    // geoToVec3 bakes theta = (lon + 180)°, so a point at longitude L lands at
+    // theta = (L+180)°.  The camera sits at +Z; to bring longitude M to the
+    // front hemisphere we need the group rotated so that theta + rotY = 90°:
+    //   rotY = 90° - (M + 180)° = -(M + 90)° = -(M * DEG) - PI/2
+    let targetRotY = 0;
+    let targetRotX = 0;
+    if (selectedEvent) {
+      const pLat = selectedEvent.primary_lat   ?? noradToLatLon(selectedEvent.norad_id)[0];
+      const pLon = selectedEvent.primary_lon   ?? noradToLatLon(selectedEvent.norad_id)[1];
+      const sLat = selectedEvent.secondary_lat ?? noradToLatLon(selectedEvent.secondary_norad_id)[0];
+      const sLon = selectedEvent.secondary_lon ?? noradToLatLon(selectedEvent.secondary_norad_id)[1];
+      const midLon = (pLon + sLon) / 2;
+      const midLat = (pLat + sLat) / 2;
+      targetRotY = -(midLon * DEG) - Math.PI / 2;
+      targetRotX = -(midLat * DEG) * 0.7;
+    }
+
+    // ── mouse drag ────────────────────────────────────────────────────────
     let isDragging = false;
     let prevX = 0, prevY = 0;
-    const group = new THREE.Group();
-    scene.children.filter(c => c !== sunLight).forEach(c => group.add(c));
-    scene.add(group);
 
-    const onDown = (e: MouseEvent) => { isDragging = true; prevX = e.clientX; prevY = e.clientY; };
-    const onUp   = () => { isDragging = false; };
+    const onDown = (e: MouseEvent) => {
+      isDragging = true; prevX = e.clientX; prevY = e.clientY;
+    };
+    const onUp = () => { isDragging = false; };
     const onMove = (e: MouseEvent) => {
       if (!isDragging) return;
       group.rotation.y += (e.clientX - prevX) * 0.005;
       group.rotation.x += (e.clientY - prevY) * 0.003;
       group.rotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, group.rotation.x));
+      // Sync snap target so lerp doesn't fight the user after dragging
+      targetRotY = group.rotation.y;
+      targetRotX = group.rotation.x;
       prevX = e.clientX; prevY = e.clientY;
     };
     container.addEventListener("mousedown", onDown);
     window.addEventListener("mouseup", onUp);
     window.addEventListener("mousemove", onMove);
 
-    // ── Camera snap-to for selected event ─────────────────────────────────
-    // Compute the target yaw/pitch that centres the conjunction midpoint.
-    let targetRotY = group.rotation.y;
-    let targetRotX = group.rotation.x;
-    if (selectedEvent) {
-      const pLat = selectedEvent.primary_lat   ?? noradToLatLon(selectedEvent.norad_id)[0];
-      const pLon = selectedEvent.primary_lon   ?? noradToLatLon(selectedEvent.norad_id)[1];
-      const sLat = selectedEvent.secondary_lat ?? noradToLatLon(selectedEvent.secondary_norad_id)[0];
-      const sLon = selectedEvent.secondary_lon ?? noradToLatLon(selectedEvent.secondary_norad_id)[1];
-      const midLat = (pLat + sLat) / 2;
-      const midLon = (pLon + sLon) / 2;
-      // We want the midpoint to face the camera (camera is at +Z).
-      // The group's Y rotation maps longitude; X maps latitude.
-      targetRotY = -(midLon * DEG) - Math.PI;
-      targetRotX = -(midLat * DEG) * 0.8; // slight damping on pitch
-    }
-
-    // ── Resize handler ────────────────────────────────────────────────────
+    // ── resize ────────────────────────────────────────────────────────────
     const onResize = () => {
       const w = container.clientWidth;
       const h = container.clientHeight;
@@ -349,42 +348,40 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
     };
     window.addEventListener("resize", onResize);
 
-    // ── Animation loop ────────────────────────────────────────────────────
+    // ── animation loop ────────────────────────────────────────────────────
     let t = 0;
     const animate = () => {
       frameRef.current = requestAnimationFrame(animate);
       t += 0.016;
 
-      // Auto-spin when not dragging
+      // Rotation
       if (!isDragging) {
         if (selectedEvent) {
-          // Lerp toward the snap-to target
-          group.rotation.y += (targetRotY - group.rotation.y) * 0.04;
-          group.rotation.x += (targetRotX - group.rotation.x) * 0.04;
+          group.rotation.y += (targetRotY - group.rotation.y) * 0.05;
+          group.rotation.x += (targetRotX - group.rotation.x) * 0.05;
         } else {
           group.rotation.y += 0.0015;
         }
       }
 
-      // Pulse CRITICAL/HIGH event nodes
+      // Pulse high-risk event nodes
       eventNodes.forEach((node) => {
         const { basePc, phase } = node.userData as { basePc: number; phase: number };
         const tier = getRiskTier(basePc);
         if (tier === "CRITICAL" || tier === "HIGH") {
-          const pulse = 1 + 0.35 * Math.sin(t * 3 + phase);
-          node.scale.setScalar(pulse);
+          node.scale.setScalar(1 + 0.35 * Math.sin(t * 3 + phase));
         }
       });
 
-      // Pulse the selection rings
+      // Animate selection overlay
       selGroup.children.forEach((child) => {
-        if ((child as THREE.Mesh).userData?.isPulseRing) {
-          const pulse = 1 + 0.25 * Math.sin(t * 4);
-          child.scale.setScalar(pulse);
+        const mesh = child as THREE.Mesh;
+        if (mesh.userData?.isPulseRing) {
+          mesh.scale.setScalar(1 + 0.30 * Math.sin(t * 4.5));
         }
-        if ((child as THREE.Mesh).userData?.isHalo) {
-          const mat = (child as THREE.Mesh).material as THREE.MeshBasicMaterial;
-          mat.opacity = 0.3 + 0.25 * Math.sin(t * 2.5);
+        if (mesh.userData?.isHalo) {
+          (mesh.material as THREE.MeshBasicMaterial).opacity =
+            0.35 + 0.35 * Math.sin(t * 2.8);
         }
       });
 
@@ -392,7 +389,7 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
     };
     animate();
 
-    // ── Cleanup ───────────────────────────────────────────────────────────
+    // ── cleanup ───────────────────────────────────────────────────────────
     return () => {
       cancelAnimationFrame(frameRef.current);
       window.removeEventListener("resize", onResize);
@@ -400,11 +397,9 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
       window.removeEventListener("mouseup", onUp);
       window.removeEventListener("mousemove", onMove);
       renderer.dispose();
-      if (container.contains(renderer.domElement)) {
-        container.removeChild(renderer.domElement);
-      }
+      if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
     };
-  }, [events, selectedEvent]); // re-run when events or selection changes
+  }, [events, selectedEvent]);
 
   return (
     <div

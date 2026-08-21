@@ -16,6 +16,8 @@ interface Props {
   events: ConjunctionEvent[];
   loading: boolean;
   onSelectEvent: (event: ConjunctionEvent) => void;
+  /** Called with the hovered event (or null on mouse-leave) */
+  onHoverEvent?: (event: ConjunctionEvent | null) => void;
 }
 
 const TIER_BADGE: Record<string, string> = {
@@ -32,7 +34,7 @@ const TIER_ROW_BG: Record<string, string> = {
   MONITOR:  "hover:bg-slate-800/50",
 };
 
-export default function ConjunctionTable({ events, loading, onSelectEvent }: Props) {
+export default function ConjunctionTable({ events, loading, onSelectEvent, onHoverEvent }: Props) {
   const [search, setSearch] = useState("");
   const [tierFilter, setTierFilter] = useState<string>("ALL");
   const [sortAsc, setSortAsc] = useState(false); // default desc (highest risk first)
@@ -155,6 +157,8 @@ export default function ConjunctionTable({ events, loading, onSelectEvent }: Pro
                       TIER_ROW_BG[tier]
                     )}
                     onClick={() => onSelectEvent(evt)}
+                    onMouseEnter={() => onHoverEvent?.(evt)}
+                    onMouseLeave={() => onHoverEvent?.(null)}
                   >
                     {/* Risk badge */}
                     <td className="px-4 py-2.5">
