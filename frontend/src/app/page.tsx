@@ -278,15 +278,15 @@ export default function DashboardPage() {
             />
           </div>
 
-          {/* Legend */}
+          {/* Legend — describes what the globe actually renders */}
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500 px-1 shrink-0">
             {[
-              { colour: "bg-red-500",    label: "Critical" },
-              { colour: "bg-orange-500", label: "High" },
-              { colour: "bg-yellow-500", label: "Elevated" },
-              { colour: "bg-green-500",  label: "Monitor" },
-              { colour: "bg-slate-400",  label: "Active satellite" },
-              { colour: "bg-cyan-400",   label: "Secondary (selected)" },
+              { colour: "bg-red-500",    label: "Critical event" },
+              { colour: "bg-orange-500", label: "High event" },
+              { colour: "bg-yellow-500", label: "Elevated event" },
+              { colour: "bg-green-500",  label: "Monitor event" },
+              { colour: "bg-white",      label: "Focused conjunction" },
+              { colour: "bg-red-500",    label: "True-scale separation at TCA (inset)" },
             ].map(({ colour, label }) => (
               <span key={label} className="flex items-center gap-1.5">
                 <span className={clsx("w-2 h-2 rounded-full", colour)} />
@@ -294,6 +294,11 @@ export default function DashboardPage() {
               </span>
             ))}
           </div>
+          {/* Scientific context note */}
+          <p className="text-xs text-slate-600 px-1 leading-snug">
+            Markers show conjunction locations at each event&apos;s TCA; positions are not a simultaneous orbital snapshot.
+            Auto-spin: display only.
+          </p>
         </div>
 
         {/* Table column — scrolls internally, never pushes the globe */}

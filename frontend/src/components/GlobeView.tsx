@@ -4,15 +4,22 @@
  * GlobeView.tsx — Three.js 3-D Earth globe + magnified encounter inset
  *
  * Two-level visualization:
- *   1. True-position globe marker — the conjunction midpoint is plotted at its
- *      real TCA lat/lon.  At Earth scale, 0.40 km separation is sub-pixel;
- *      one glyph per pair avoids overlap.
+ *   1. Persistent midpoint markers — every conjunction event receives one
+ *      InstancedMesh instance positioned at the event's geographic midpoint
+ *      (average lat/lon of primary and secondary at each event's own TCA).
+ *      At Earth scale a 0.40 km object separation is sub-pixel; one marker
+ *      per event pair avoids overlap and accurately represents the data.
  *
- *   2. Magnified encounter inset (Canvas 2-D) — always shows two clearly
- *      separated and labelled objects connected by a bright red dashed line.
- *      Labelled "Encounter geometry magnified — not to scale".
- *      No approach-direction arrows are drawn because scalar relative speed
- *      alone does not determine 3-D approach direction.
+ *      Markers are NOT a simultaneous orbital snapshot. Each event's position
+ *      was evaluated at that event's own TCA. Different events have different
+ *      TCAs; combining them on one globe is a multi-epoch composite used
+ *      only for situational awareness, not for orbital mechanics.
+ *
+ *   2. Magnified encounter inset (Canvas 2-D) — shows the primary and
+ *      secondary objects at a readable pixel separation (~180 px) connected
+ *      by a red dashed line. Labelled "Encounter geometry magnified — not to
+ *      scale". Separate PRIMARY/SECONDARY labels and NORAD IDs are provided
+ *      here because on the globe they would overlap at true Earth scale.
  *
  * Scene re-creation strategy:
  *   The Three.js effect depends only on `events` (the static list).
@@ -33,10 +40,17 @@ import { getRiskTier } from "@/lib/types";
 const DEG        = Math.PI / 180;
 const R_EARTH_KM = 6371;
 
+/**
+ * Maximum number of context arc lines rendered across all events.
+ * Priority: CRITICAL → HIGH → ELEVATED → top MONITOR by descending Pc.
+ * Lines are decorative only; they do NOT represent propagated trajectories.
+ */
+export const MAX_CONTEXT_LINES = 60;
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /** lat/lon (deg) + altKm → Three.js XYZ on the scaled globe sphere */
-function geoToVec3(lat: number, lon: number, altKm: number): THREE.Vector3 {
+export function geoToVec3(lat: number, lon: number, altKm: number): THREE.Vector3 {
   const r     = 1 + (altKm / R_EARTH_KM) * 0.8 + 0.06;
   const phi   = (90 - lat)  * DEG;
   const theta = (lon + 180) * DEG;
@@ -52,7 +66,7 @@ function geoToVec3(lat: number, lon: number, altKm: number): THREE.Vector3 {
  * This correctly handles antimeridian crossing (e.g. 179.9° and -179.9°)
  * where simple arithmetic averaging would give 0° instead of ±180°.
  */
-function geoMidpoint(
+export function geoMidpoint(
   lat1: number, lon1: number,
   lat2: number, lon2: number,
 ): [number, number] {
@@ -74,7 +88,7 @@ function geoMidpoint(
 }
 
 /** Deterministic pseudo-random lat/lon from NORAD ID — positional fallback */
-function noradToLatLon(id: number): [number, number] {
+export function noradToLatLon(id: number): [number, number] {
   const seed = id * 0.6180339887;
   return [
     (((seed * 127.3) % 1) * 160) - 80,
@@ -116,7 +130,7 @@ function buildArcTube(
 }
 
 // ── risk colours ──────────────────────────────────────────────────────────────
-const RISK_COLOUR: Record<string, number> = {
+export const RISK_COLOUR: Record<string, number> = {
   CRITICAL: 0xef4444,
   HIGH:     0xf97316,
   ELEVATED: 0xeab308,
@@ -129,6 +143,107 @@ const RISK_CSS: Record<string, string> = {
   ELEVATED: "#eab308",
   MONITOR:  "#22c55e",
 };
+
+// ── marker data preparation ───────────────────────────────────────────────────
+
+/**
+ * Compute the world-space position for a conjunction event's midpoint marker.
+ * Exported for unit testing without a WebGL context.
+ */
+export function eventMarkerPosition(evt: ConjunctionEvent): THREE.Vector3 {
+  const pLat = evt.primary_lat    ?? noradToLatLon(evt.norad_id)[0];
+  const pLon = evt.primary_lon    ?? noradToLatLon(evt.norad_id)[1];
+  const pAlt = evt.primary_alt_km ?? 400;
+  const sLat = evt.secondary_lat    ?? noradToLatLon(evt.secondary_norad_id)[0];
+  const sLon = evt.secondary_lon    ?? noradToLatLon(evt.secondary_norad_id)[1];
+  const sAlt = evt.secondary_alt_km ?? 400;
+  const [midLat, midLon] = geoMidpoint(pLat, pLon, sLat, sLon);
+  const midAlt = (pAlt + sAlt) / 2;
+  return geoToVec3(midLat, midLon, midAlt);
+}
+
+/**
+ * Group events by risk tier, returning a plain count map.
+ * This pure function is exported for unit testing without any WebGL calls.
+ */
+export function countEventsByTier(events: ConjunctionEvent[]): Record<string, number> {
+  const counts: Record<string, number> = {
+    CRITICAL: 0, HIGH: 0, ELEVATED: 0, MONITOR: 0,
+  };
+  for (const evt of events) {
+    const tier = getRiskTier(evt.pc_value);
+    counts[tier] = (counts[tier] ?? 0) + 1;
+  }
+  return counts;
+}
+
+/**
+ * Build one InstancedMesh per risk tier and add them to the scene group.
+ * Returns the created meshes and the total instance count (= events.length).
+ * Uses normal depth testing so far-side markers are correctly occluded.
+ */
+export function buildInstancedMarkers(
+  events: ConjunctionEvent[],
+  scene: THREE.Group
+): { meshes: THREE.InstancedMesh[]; count: number } {
+  const TIERS = ["CRITICAL", "HIGH", "ELEVATED", "MONITOR"] as const;
+  const byTier: Record<string, ConjunctionEvent[]> = {
+    CRITICAL: [], HIGH: [], ELEVATED: [], MONITOR: [],
+  };
+  for (const evt of events) {
+    const tier = getRiskTier(evt.pc_value);
+    byTier[tier].push(evt);
+  }
+
+  // Low-poly octahedron as marker geometry — 8 triangles, minimal vertex count
+  const markerGeo = new THREE.OctahedronGeometry(0.013, 0);
+  const dummy = new THREE.Object3D();
+  const meshes: THREE.InstancedMesh[] = [];
+  let totalCount = 0;
+
+  for (const tier of TIERS) {
+    const tierEvents = byTier[tier];
+    if (tierEvents.length === 0) continue;
+
+    const colour = RISK_COLOUR[tier];
+    const mat = new THREE.MeshBasicMaterial({ color: colour });
+    const iMesh = new THREE.InstancedMesh(markerGeo, mat, tierEvents.length);
+    iMesh.frustumCulled = false; // keep all instances; Earth occludes far-side
+
+    for (let i = 0; i < tierEvents.length; i++) {
+      const pos = eventMarkerPosition(tierEvents[i]);
+      dummy.position.copy(pos);
+      dummy.updateMatrix();
+      iMesh.setMatrixAt(i, dummy.matrix);
+    }
+    iMesh.instanceMatrix.needsUpdate = true;
+    scene.add(iMesh);
+    meshes.push(iMesh);
+    totalCount += tierEvents.length;
+  }
+
+  // The shared markerGeo is referenced by all InstancedMeshes;
+  // each mesh holds its own reference so we do not dispose here.
+  return { meshes, count: totalCount };
+}
+
+/**
+ * Select the top-priority events for context arc lines.
+ * Returns at most MAX_CONTEXT_LINES events, prioritised by tier then Pc.
+ * Line sampling DOES NOT reduce the persistent marker count.
+ */
+export function selectLineEvents(events: ConjunctionEvent[]): ConjunctionEvent[] {
+  const TIER_RANK: Record<string, number> = {
+    CRITICAL: 0, HIGH: 1, ELEVATED: 2, MONITOR: 3,
+  };
+  const sorted = [...events].sort((a, b) => {
+    const ta = TIER_RANK[getRiskTier(a.pc_value)] ?? 4;
+    const tb = TIER_RANK[getRiskTier(b.pc_value)] ?? 4;
+    if (ta !== tb) return ta - tb;
+    return b.pc_value - a.pc_value; // descending Pc within tier
+  });
+  return sorted.slice(0, MAX_CONTEXT_LINES);
+}
 
 // ── props ─────────────────────────────────────────────────────────────────────
 interface GlobeViewProps {
@@ -396,7 +511,8 @@ export default function GlobeView({
     }
     const starGeo = new THREE.BufferGeometry();
     starGeo.setAttribute("position", new THREE.Float32BufferAttribute(starVerts, 3));
-    group.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 0.18 })));
+    const starMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.18 });
+    group.add(new THREE.Points(starGeo, starMat));
 
     // ── Textured Earth ────────────────────────────────────────────────────────
     // Load textures via TextureLoader.  On failure we fall back to a plain
@@ -466,9 +582,9 @@ export default function GlobeView({
     group.add(cloudMesh);
 
     // ── Atmospheric rim (Fresnel-style ShaderMaterial) ────────────────────────
-    // BackSide + additive blending creates a thin blue glow at the limb without
-    // applying a haze over the surface.
-    const atmosGeo = new THREE.SphereGeometry(1.05, 32, 32);
+    // BackSide + additive blending creates a thin blue glow at the limb only.
+    // Radius ≤ 1.03 and low peak alpha keep it as a subtle rim, not a haze.
+    const atmosGeo = new THREE.SphereGeometry(1.03, 32, 32);
     const atmosMat = new THREE.ShaderMaterial({
       vertexShader: `
         varying vec3 vNormal;
@@ -485,8 +601,8 @@ export default function GlobeView({
         varying vec3 vViewDir;
         void main() {
           float rim = 1.0 - max(dot(vNormal, vViewDir), 0.0);
-          rim = pow(rim, 3.5);
-          gl_FragColor = vec4(0.25, 0.55, 1.0, rim * 0.55);
+          rim = pow(rim, 4.5);
+          gl_FragColor = vec4(0.20, 0.45, 0.85, rim * 0.25);
         }
       `,
       transparent: true,
@@ -497,7 +613,7 @@ export default function GlobeView({
     const atmosMesh = new THREE.Mesh(atmosGeo, atmosMat);
     group.add(atmosMesh);
 
-    // LEO reference ring
+    // ── LEO reference ring ────────────────────────────────────────────────────
     const leoRing = new THREE.Mesh(
       new THREE.TorusGeometry(1.18, 0.003, 4, 120),
       new THREE.MeshBasicMaterial({ color: 0x334466, transparent: true, opacity: 0.4 })
@@ -505,18 +621,26 @@ export default function GlobeView({
     leoRing.rotation.x = Math.PI / 2;
     group.add(leoRing);
 
-    // Background satellite dots
-    const satGeo = new THREE.SphereGeometry(0.008, 6, 6);
-    const satMat = new THREE.MeshBasicMaterial({ color: 0x94a3b8 });
-    for (let i = 0; i < 60; i++) {
-      const dot = new THREE.Mesh(satGeo, satMat);
-      dot.position.copy(geoToVec3(Math.random() * 160 - 80, Math.random() * 360 - 180, 400));
-      group.add(dot);
-    }
+    // ── Persistent event markers (InstancedMesh per tier) ────────────────────
+    // One octahedron instance per conjunction event, colored by risk tier.
+    // Uses normal depth testing — far-side markers are correctly occluded.
+    //
+    // NOTE: These markers represent each event's conjunction location at that
+    //       event's own TCA. They are NOT a simultaneous orbital snapshot;
+    //       different events have different TCAs and the globe is a multi-epoch
+    //       composite for situational awareness only.
+    const { meshes: instancedMeshes, count: instancedCount } =
+      buildInstancedMarkers(events, group);
+    void instancedCount; // count available for diagnostics; not used at runtime
 
-    // Conjunction event nodes — single midpoint glyph per pair
-    const eventNodes: THREE.Mesh[] = [];
-    events.slice(0, 60).forEach((evt) => {
+    // ── Context arc lines (limited subset only) ───────────────────────────────
+    // Lines are decorative and do NOT represent propagated satellite trajectories.
+    // Limited to MAX_CONTEXT_LINES to avoid visual clutter. Line sampling does
+    // not reduce the persistent marker count above.
+    const lineGeos: THREE.BufferGeometry[] = [];
+    const lineMats: THREE.LineBasicMaterial[] = [];
+
+    selectLineEvents(events).forEach((evt) => {
       const tier   = getRiskTier(evt.pc_value);
       const colour = RISK_COLOUR[tier] ?? 0xffffff;
 
@@ -527,30 +651,26 @@ export default function GlobeView({
       const sLon = evt.secondary_lon    ?? noradToLatLon(evt.secondary_norad_id)[1];
       const sAlt = evt.secondary_alt_km ?? 400;
 
-      // Use 3-D unit-vector midpoint to avoid antimeridian averaging error
       const [midLat, midLon] = geoMidpoint(pLat, pLon, sLat, sLon);
       const midAlt = (pAlt + sAlt) / 2;
-
-      const node = new THREE.Mesh(
-        new THREE.SphereGeometry(0.018, 8, 8),
-        new THREE.MeshBasicMaterial({ color: colour })
-      );
-      node.position.copy(geoToVec3(midLat, midLon, midAlt));
-      node.userData = { basePc: evt.pc_value, phase: Math.random() * Math.PI * 2 };
-      group.add(node);
-      eventNodes.push(node);
 
       const arcPts: THREE.Vector3[] = [];
       for (let a = 0; a <= 360; a += 4) {
         arcPts.push(geoToVec3(midLat * Math.cos(a * DEG * 0.5), midLon + a * 0.6, midAlt));
       }
-      group.add(new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(arcPts),
-        new THREE.LineBasicMaterial({ color: colour, transparent: true, opacity: 0.18 })
-      ));
+      const lGeo = new THREE.BufferGeometry().setFromPoints(arcPts);
+      const lMat = new THREE.LineBasicMaterial({
+        color: colour, transparent: true, opacity: 0.18,
+      });
+      group.add(new THREE.Line(lGeo, lMat));
+      lineGeos.push(lGeo);
+      lineMats.push(lMat);
     });
 
-    // Selected-conjunction overlay group (updated without scene recreation)
+    // ── Selected-conjunction overlay group ────────────────────────────────────
+    // Updated without scene recreation via buildOverlayFn ref.
+    // Shows temporary focus glyph + red true-position arc on hover/select;
+    // cleared on mouse-leave if not click-locked.
     const selGroup = new THREE.Group();
     group.add(selGroup);
     selGroupRef.current = selGroup;
@@ -588,11 +708,13 @@ export default function GlobeView({
           depthTest: false, depthWrite: false,
         });
 
+      // White core at conjunction midpoint
       const core = new THREE.Mesh(new THREE.SphereGeometry(0.032, 12, 12), overlayMat(0xffffff));
       core.position.copy(midPos);
       core.renderOrder = 999;
       selGroup.add(core);
 
+      // Risk-coloured wireframe halo
       const halo = new THREE.Mesh(new THREE.SphereGeometry(0.062, 14, 14), overlayMat(pColour, 0.7));
       (halo.material as THREE.MeshBasicMaterial).wireframe = true;
       halo.position.copy(midPos);
@@ -600,6 +722,7 @@ export default function GlobeView({
       halo.userData.isHalo = true;
       selGroup.add(halo);
 
+      // Pulse ring
       const ring = new THREE.Mesh(
         new THREE.TorusGeometry(0.080, 0.010, 8, 48),
         overlayMat(pColour, 0.95)
@@ -610,6 +733,9 @@ export default function GlobeView({
       ring.userData.isPulseRing = true;
       selGroup.add(ring);
 
+      // Red arc — true-scale separation between primary and secondary at TCA.
+      // At Earth scale the two endpoints will frequently appear coincident;
+      // the magnified encounter inset shows the separation at readable scale.
       const posA = geoToVec3(pLat, pLon, pAlt);
       const posB = geoToVec3(sLat, sLon, sAlt);
       const arcR = Math.max(posA.length(), posB.length()) + 0.02;
@@ -630,8 +756,6 @@ export default function GlobeView({
     buildOverlay(focusEventRef.current);
 
     // Point snap ref at the shared object — read by animation loop each frame.
-    // This avoids storing snap state on the Three.js group (which would require
-    // casting through _snapTarget and is unreliable across effect teardowns).
     const snap = snapRef.current;
 
     // Compute initial snap from current selectedEvent ref
@@ -702,14 +826,6 @@ export default function GlobeView({
         }
       }
 
-      eventNodes.forEach((node) => {
-        const { basePc, phase } = node.userData as { basePc: number; phase: number };
-        const tier = getRiskTier(basePc);
-        if (tier === "CRITICAL" || tier === "HIGH") {
-          node.scale.setScalar(1 + 0.35 * Math.sin(t * 3 + phase));
-        }
-      });
-
       selGroup.children.forEach((child) => {
         const mesh = child as THREE.Mesh;
         if (mesh.userData?.isPulseRing) mesh.scale.setScalar(1 + 0.28 * Math.sin(t * 4.5));
@@ -741,6 +857,24 @@ export default function GlobeView({
       cloudMat.dispose();
       atmosGeo.dispose();
       atmosMat.dispose();
+
+      // Dispose instanced marker resources
+      // Each mesh shares the same OctahedronGeometry, so only dispose the
+      // geometry once (via the first mesh, if any exist).
+      if (instancedMeshes.length > 0) {
+        instancedMeshes[0].geometry.dispose();
+      }
+      instancedMeshes.forEach((m) => {
+        (m.material as THREE.Material).dispose();
+      });
+
+      // Dispose context line resources
+      lineGeos.forEach((g) => g.dispose());
+      lineMats.forEach((m) => m.dispose());
+
+      // Star resources
+      starGeo.dispose();
+      starMat.dispose();
 
       renderer.dispose();
       buildOverlayFn.current = null;

@@ -115,11 +115,21 @@ Objects are sampled across altitude bins (50 km width, 300–1200 km) proportion
 
 ### Two-Level Architecture
 
-1. **True-position globe marker** — each conjunction pair is rendered as a single midpoint glyph at its real TCA lat/lon on the Earth-scale globe. At typical LEO altitudes a 0.40 km separation is sub-pixel; one glyph per pair avoids overlap.
+1. **Persistent midpoint markers** — every conjunction event receives one `THREE.InstancedMesh` instance positioned at the event's geographic midpoint, computed from the primary and secondary positions at that event's TCA. Risk tier is encoded as color (CRITICAL: red, HIGH: orange, ELEVATED: yellow, MONITOR: green). Normal depth testing is used so far-side markers are correctly occluded by the Earth.
 
-2. **Magnified encounter inset** — a Canvas 2-D overlay inside the globe panel displays the primary and secondary at a readable pixel separation (~180 px). A red dashed connector, object labels, miss distance, TCA, and risk tier are shown. The inset is explicitly labelled **"Encounter geometry magnified — not to scale"**.
+   **Important:** These markers are NOT a simultaneous orbital snapshot. Each event's position was evaluated at that event's own TCA. Different events have different TCAs; combining them on one globe is a multi-epoch composite used for situational awareness only.
+
+2. **Magnified encounter inset** — a Canvas 2-D overlay inside the globe panel displays the primary and secondary at a readable pixel separation (~180 px). A red dashed connector, object labels, miss distance, TCA, and risk tier are shown. The inset is explicitly labelled **"Encounter geometry magnified — not to scale"**. The PRIMARY and SECONDARY distinction is shown in the inset only, because the two endpoints are sub-pixel apart at true Earth scale.
 
 No approach-direction arrows are drawn. Scalar relative speed alone does not determine the 3-D approach direction; drawing arrows would fabricate information not available from GP data alone.
+
+### Context Arc Lines
+
+Decorative context arc lines are shown for a limited subset of events (up to `MAX_CONTEXT_LINES = 60`), prioritized CRITICAL → HIGH → ELEVATED → top MONITOR by descending Pc. These lines are **NOT propagated satellite trajectories**. Line sampling does not affect persistent marker count; all events receive markers.
+
+### Random Satellite Dots Removed
+
+The globe no longer displays random decorative white dots. They did not correspond to catalog objects, and displaying them with an "Active satellite" legend entry was misleading. Any future background catalog layer must be driven by real object positions with clearly defined epochs.
 
 ### Globe Auto-Spin
 
