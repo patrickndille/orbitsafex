@@ -372,10 +372,12 @@ export default function GlobeView({
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    const sunLight = new THREE.DirectionalLight(0xffffff, 2.2);
+    // Tuned lighting: directional "sun" + low ambient so the night side is
+    // dark but not completely black and risk markers remain dominant.
+    const sunLight = new THREE.DirectionalLight(0xffffff, 1.8);
     sunLight.position.set(5, 3, 5);
     scene.add(sunLight);
-    scene.add(new THREE.AmbientLight(0x1a2a4a, 1.2));
+    scene.add(new THREE.AmbientLight(0x1a2840, 0.6));
 
     const group = new THREE.Group();
     scene.add(group);
@@ -396,35 +398,104 @@ export default function GlobeView({
     starGeo.setAttribute("position", new THREE.Float32BufferAttribute(starVerts, 3));
     group.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 0.18 })));
 
-    // Earth sphere
-    group.add(new THREE.Mesh(
-      new THREE.SphereGeometry(1, 64, 64),
-      new THREE.MeshPhongMaterial({
-        color: 0x1a4fa8, emissive: 0x0a1f50,
-        specular: 0x3a7bd5, shininess: 60,
-      })
-    ));
+    // ── Textured Earth ────────────────────────────────────────────────────────
+    // Load textures via TextureLoader.  On failure we fall back to a plain
+    // dark-blue material so the rest of the scene still renders correctly.
+    const loader = new THREE.TextureLoader();
+    const maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
 
-    // Continent patches
-    const cMat = new THREE.MeshPhongMaterial({ color: 0x2d6a2d, emissive: 0x0f2b0f, shininess: 10 });
-    ([ [40,-100,50,65],[-15,-55,45,45],[10,20,60,40],[50,20,40,60],[30,80,40,60],[-25,135,30,30] ] as
-      [number,number,number,number][]).forEach(([lat, lon, latS, lonS]) => {
-      group.add(new THREE.Mesh(
-        new THREE.SphereGeometry(1.001, 8, 8,
-          (lon * DEG) + Math.PI, lonS * DEG,
-          (90 - lat - latS / 2) * DEG, latS * DEG),
-        cMat
-      ));
+    // Textures are tracked so they can be disposed on cleanup.
+    const loadedTextures: THREE.Texture[] = [];
+
+    const loadTex = (path: string, srgb = false): THREE.Texture | null => {
+      try {
+        const t = loader.load(
+          path,
+          undefined,
+          undefined,
+          (err) => {
+            console.warn(`[GlobeView] Texture load failed: ${path}`, err);
+          }
+        );
+        if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+        t.anisotropy = maxAniso;
+        loadedTextures.push(t);
+        return t;
+      } catch (err) {
+        console.warn(`[GlobeView] TextureLoader threw for: ${path}`, err);
+        return null;
+      }
+    };
+
+    const dayTex  = loadTex("/textures/earth/earth-day.jpg",      true);
+    const bumpTex = loadTex("/textures/earth/earth-bump.jpg",     false);
+    const specTex = loadTex("/textures/earth/earth-specular.jpg", false);
+
+    // Build the Earth material.  Falls back gracefully if textures are null
+    // (texture load failures are caught above; Three.js accepts null for
+    // optional map properties).
+    const earthGeo = new THREE.SphereGeometry(1, 64, 64);
+    const earthMat = new THREE.MeshPhongMaterial({
+      map:       dayTex  ?? undefined,
+      bumpMap:   bumpTex ?? undefined,
+      bumpScale: 0.018,
+      specularMap: specTex ?? undefined,
+      specular:  new THREE.Color(0x4a7fb5),
+      shininess: 28,
+      // Fallback color shown while textures load or if they fail
+      color: dayTex ? 0xffffff : 0x1a4fa8,
     });
+    const earthMesh = new THREE.Mesh(earthGeo, earthMat);
+    group.add(earthMesh);
 
-    // Atmosphere
-    group.add(new THREE.Mesh(
-      new THREE.SphereGeometry(1.06, 32, 32),
-      new THREE.MeshPhongMaterial({
-        color: 0x4488cc, transparent: true, opacity: 0.12,
-        side: THREE.FrontSide, depthWrite: false,
-      })
-    ));
+    // ── Cloud layer ───────────────────────────────────────────────────────────
+    // A second sphere slightly above the surface carries the cloud texture at
+    // low opacity.  depthWrite: false prevents it from obscuring markers.
+    // NOTE: cloud rotation is cosmetic only — not real weather or time.
+    const cloudTex = loadTex("/textures/earth/earth-clouds.jpg", false);
+    const cloudGeo = new THREE.SphereGeometry(1.010, 48, 48);
+    const cloudMat = new THREE.MeshPhongMaterial({
+      map:         cloudTex ?? undefined,
+      alphaMap:    cloudTex ?? undefined,
+      transparent: true,
+      opacity:     0.30,
+      depthWrite:  false,
+      color:       0xffffff,
+    });
+    const cloudMesh = new THREE.Mesh(cloudGeo, cloudMat);
+    group.add(cloudMesh);
+
+    // ── Atmospheric rim (Fresnel-style ShaderMaterial) ────────────────────────
+    // BackSide + additive blending creates a thin blue glow at the limb without
+    // applying a haze over the surface.
+    const atmosGeo = new THREE.SphereGeometry(1.05, 32, 32);
+    const atmosMat = new THREE.ShaderMaterial({
+      vertexShader: `
+        varying vec3 vNormal;
+        varying vec3 vViewDir;
+        void main() {
+          vNormal  = normalize(normalMatrix * normal);
+          vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+          vViewDir = normalize(-mvPos.xyz);
+          gl_Position = projectionMatrix * mvPos;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vNormal;
+        varying vec3 vViewDir;
+        void main() {
+          float rim = 1.0 - max(dot(vNormal, vViewDir), 0.0);
+          rim = pow(rim, 3.5);
+          gl_FragColor = vec4(0.25, 0.55, 1.0, rim * 0.55);
+        }
+      `,
+      transparent: true,
+      depthWrite:  false,
+      side:        THREE.BackSide,
+      blending:    THREE.AdditiveBlending,
+    });
+    const atmosMesh = new THREE.Mesh(atmosGeo, atmosMat);
+    group.add(atmosMesh);
 
     // LEO reference ring
     const leoRing = new THREE.Mesh(
@@ -619,6 +690,9 @@ export default function GlobeView({
       frameRef.current = requestAnimationFrame(animate);
       t += 0.016;
 
+      // Rotate cloud sphere extremely slowly relative to Earth (cosmetic only)
+      cloudMesh.rotation.y = t * 0.0008;
+
       if (!isDragging) {
         if (snap.active) {
           group.rotation.y += (snap.rotY - group.rotation.y) * 0.05;
@@ -658,6 +732,16 @@ export default function GlobeView({
       container.removeEventListener("mousedown", onDown);
       window.removeEventListener("mouseup", onUp);
       window.removeEventListener("mousemove", onMove);
+
+      // Dispose textures, geometries, and materials added by the texture upgrade
+      loadedTextures.forEach((t) => t.dispose());
+      earthGeo.dispose();
+      earthMat.dispose();
+      cloudGeo.dispose();
+      cloudMat.dispose();
+      atmosGeo.dispose();
+      atmosMat.dispose();
+
       renderer.dispose();
       buildOverlayFn.current = null;
       selGroupRef.current    = null;
