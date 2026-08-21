@@ -1,8 +1,8 @@
-Fix test unpacking, camera snap refactor, restore production DB, rewrite docs
+Fix GlobeView resize on inset dismissal; add close button and toggle select
 
-- Fix test_run_conjunction_scan_returns_position_fields: unpack tuple return from run_conjunction_scan() (backend/tests/test_orbital_math.py:596)
-- Refactor GlobeView camera snap: replace broken renderer._scene traversal with shared useRef (frontend/src/components/GlobeView.tsx)
-- Restore production orbitsafe.db to pre-work state (57,344 bytes) via git checkout HEAD
-- Rewrite NOTES.md: remove fabricated claims, document completed work, add scientific limitations and auto-spin disclaimer
+- Replace window.resize with ResizeObserver on mountRef container so renderer resizes when EncounterInset mounts/unmounts (frontend/src/components/GlobeView.tsx)
+- Add close × button on locked inset; wire onCloseInset prop and handleCloseSelection to clear both selectedEvent and hoveredEvent (frontend/src/app/page.tsx)
+- Implement click-to-toggle deselect on selected row (handleSelectEvent returns null on re-click)
+- Add Jest + RTL test setup with Three.js/lucide mocks; 10 tests covering resize behavior and hover/selection semantics
 
-All 21 tests pass. Frontend builds clean. Production DB untouched.
+All 10 frontend tests pass. Build clean.

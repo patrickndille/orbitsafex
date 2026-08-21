@@ -24,6 +24,7 @@
  */
 
 import { useEffect, useRef, useCallback } from "react";
+import { X } from "lucide-react";
 import * as THREE from "three";
 import type { ConjunctionEvent } from "@/lib/types";
 import { getRiskTier } from "@/lib/types";
@@ -133,10 +134,19 @@ const RISK_CSS: Record<string, string> = {
 interface GlobeViewProps {
   events: ConjunctionEvent[];
   selectedEvent?: ConjunctionEvent | null;
+  /** Called when the operator closes the inset (clears click-lock) */
+  onCloseInset?: () => void;
 }
 
 // ── EncounterInset — Canvas 2-D magnified encounter overlay ───────────────────
-function EncounterInset({ event }: { event: ConjunctionEvent }) {
+interface EncounterInsetProps {
+  event: ConjunctionEvent;
+  /** True when this event is click-locked (shows close button) */
+  locked?: boolean;
+  onClose?: () => void;
+}
+
+function EncounterInset({ event, locked, onClose }: EncounterInsetProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const draw = useCallback(() => {
@@ -283,18 +293,29 @@ function EncounterInset({ event }: { event: ConjunctionEvent }) {
   useEffect(() => { draw(); }, [draw]);
 
   return (
-    <canvas
-      ref={canvasRef}
-      width={420}
-      height={200}
-      className="w-full rounded-lg border border-red-900/40"
-      style={{ display: "block" }}
-    />
+    <div className="relative">
+      <canvas
+        ref={canvasRef}
+        width={420}
+        height={200}
+        className="w-full rounded-lg border border-red-900/40"
+        style={{ display: "block" }}
+      />
+      {locked && onClose && (
+        <button
+          onClick={onClose}
+          aria-label="Close encounter inset"
+          className="absolute top-1.5 right-1.5 w-5 h-5 flex items-center justify-center rounded bg-slate-800/80 border border-slate-600/60 text-slate-400 hover:text-slate-100 hover:bg-slate-700 transition"
+        >
+          <X className="w-3 h-3" />
+        </button>
+      )}
+    </div>
   );
 }
 
 // ── component ─────────────────────────────────────────────────────────────────
-export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
+export default function GlobeView({ events, selectedEvent, onCloseInset }: GlobeViewProps) {
   const mountRef    = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const frameRef    = useRef<number>(0);
@@ -559,13 +580,21 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
     window.addEventListener("mouseup", onUp);
     window.addEventListener("mousemove", onMove);
 
+    // ResizeObserver handles BOTH window resizes and container height changes
+    // (e.g. EncounterInset mounting/unmounting changes the flex layout height).
     const onResize = () => {
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      camera.aspect = w / h;
+      const { width, height } = container.getBoundingClientRect();
+      if (width === 0 || height === 0) return; // ignore zero dims during transitions
+      camera.aspect = width / height;
       camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
+      renderer.setSize(width, height);
+      // Keep the CSS canvas at 100% so it fills the div after resize
+      renderer.domElement.style.width  = "100%";
+      renderer.domElement.style.height = "100%";
     };
+    const ro = new ResizeObserver(onResize);
+    ro.observe(container);
+    // Also keep window resize for good measure (handles viewport scale changes)
     window.addEventListener("resize", onResize);
 
     // Animation loop
@@ -609,6 +638,7 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
 
     return () => {
       cancelAnimationFrame(frameRef.current);
+      ro.disconnect();
       window.removeEventListener("resize", onResize);
       container.removeEventListener("mousedown", onDown);
       window.removeEventListener("mouseup", onUp);
@@ -648,13 +678,17 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
     <div className="w-full h-full flex flex-col">
       <div
         ref={mountRef}
-        className="flex-1 rounded-t-xl overflow-hidden cursor-grab active:cursor-grabbing"
+        className="flex-1 overflow-hidden cursor-grab active:cursor-grabbing"
         style={{ minHeight: "280px" }}
       />
 
       {selectedEvent && (
-        <div className="px-3 pb-3 pt-2 bg-space-950/80 rounded-b-xl border-t border-red-900/30">
-          <EncounterInset event={selectedEvent} />
+        <div className="px-3 pb-3 pt-2 bg-space-950/80 border-t border-red-900/30 shrink-0">
+          <EncounterInset
+            event={selectedEvent}
+            locked={true}
+            onClose={onCloseInset}
+          />
         </div>
       )}
     </div>

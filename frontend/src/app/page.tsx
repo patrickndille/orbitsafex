@@ -81,8 +81,24 @@ export default function DashboardPage() {
   const [hoveredEvent, setHoveredEvent]   = useState<ConjunctionEvent | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
 
-  // Globe inset shows the hovered row first; falls back to the click-locked selection
+  // Globe glyph follows hover first; falls back to the click-locked selection.
+  // The encounter inset in GlobeView is only shown for the click-locked selection.
   const globeEvent = hoveredEvent ?? selectedEvent;
+
+  /** Toggle selection — clicking the already-selected row deselects it. */
+  const handleSelectEvent = useCallback((evt: ConjunctionEvent) => {
+    setSelectedEvent((prev) =>
+      prev?.norad_id === evt.norad_id && prev?.secondary_norad_id === evt.secondary_norad_id
+        ? null
+        : evt
+    );
+  }, []);
+
+  /** Close the inset and clear selection (used by the inset × button and Triage drawer). */
+  const handleCloseSelection = useCallback(() => {
+    setSelectedEvent(null);
+    setHoveredEvent(null);
+  }, []);
 
   const runScan = useCallback(async () => {
     setLoading(true);
@@ -235,7 +251,11 @@ export default function DashboardPage() {
 
           {/* Globe container: fixed height on mobile, fills column on xl */}
           <div className="h-[420px] xl:h-0 xl:flex-1 rounded-xl border border-slate-700/50 overflow-hidden bg-space-900">
-            <GlobeView events={events} selectedEvent={globeEvent} />
+            <GlobeView
+              events={events}
+              selectedEvent={globeEvent}
+              onCloseInset={handleCloseSelection}
+            />
           </div>
 
           {/* Legend */}
@@ -271,7 +291,7 @@ export default function DashboardPage() {
                events={events}
                loading={loading}
                selectedEvent={selectedEvent}
-               onSelectEvent={setSelectedEvent}
+               onSelectEvent={handleSelectEvent}
                onHoverEvent={setHoveredEvent}
              />
           </div>
@@ -287,7 +307,7 @@ export default function DashboardPage() {
       {/* ── Triage Drawer ─────────────────────────────────────────────── */}
       <TriageDrawer
         event={selectedEvent}
-        onClose={() => setSelectedEvent(null)}
+        onClose={handleCloseSelection}
       />
 
       {/* ── Scan History Drawer ───────────────────────────────────────── */}
