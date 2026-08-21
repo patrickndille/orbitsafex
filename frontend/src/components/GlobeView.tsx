@@ -9,12 +9,19 @@
  *
  * Selected-conjunction overlay (built by buildOverlay):
  *   Per object (primary + secondary):
- *     • White core sphere
+ *     • Bright core sphere (PRIMARY=white, SECONDARY=cyan)
  *     • Coloured wireframe halo (breathing opacity)
  *     • Torus ring oriented radially outward (pulsing scale)
  *   Connector:
- *     • Bright red great-circle arc (80 segments)
+ *     • TubeGeometry arc (depthTest:false) — always visible over globe
+ *     • Animated dashes via opacity pulse
  *     • White midpoint dot
+ *
+ * Why TubeGeometry instead of THREE.Line:
+ *   WebGL ignores linewidth > 1, and THREE.Line with depthTest:true is
+ *   clipped by the Earth sphere wherever the arc passes through the
+ *   globe interior.  A TubeGeometry is a real mesh — it can be rendered
+ *   with depthTest:false so it always draws on top of everything.
  */
 
 import { useEffect, useRef } from "react";
@@ -50,13 +57,45 @@ function noradToLatLon(id: number): [number, number] {
   ];
 }
 
-/** 80-segment great-circle arc at radius r between two world-space vectors */
+/** 80-segment great-circle arc at radius r between two unit-sphere vectors */
 function greatCircleArc(a: THREE.Vector3, b: THREE.Vector3, r: number): THREE.Vector3[] {
   const ua = a.clone().normalize();
   const ub = b.clone().normalize();
   return Array.from({ length: 81 }, (_, i) =>
     ua.clone().lerp(ub, i / 80).normalize().multiplyScalar(r)
   );
+}
+
+/**
+ * Build a TubeGeometry that follows a great-circle arc.
+ * Using TubeGeometry (a real 3-D mesh) instead of THREE.Line because:
+ *   • WebGL silently ignores linewidth > 1 — lines are always 1 px
+ *   • depthTest:false on a mesh works correctly; on a Line it z-fights badly
+ * The tube is rendered with depthTest:false so it draws on top of the globe
+ * surface regardless of which side of the Earth the arc passes through.
+ */
+function buildArcTube(
+  posA: THREE.Vector3,
+  posB: THREE.Vector3,
+  arcR: number,
+  colour: number,
+  opacity: number,
+  tubeRadius = 0.006
+): THREE.Mesh {
+  const pts = greatCircleArc(posA, posB, arcR);
+  const curve = new THREE.CatmullRomCurve3(pts);
+  const geo   = new THREE.TubeGeometry(curve, 80, tubeRadius, 6, false);
+  const mat   = new THREE.MeshBasicMaterial({
+    color:       colour,
+    transparent: true,
+    opacity:     opacity,
+    depthTest:   false,   // ← key: always renders on top of Earth
+    depthWrite:  false,
+    side:        THREE.DoubleSide,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.renderOrder = 999; // draw after everything else
+  return mesh;
 }
 
 // ── risk colours ─────────────────────────────────────────────────────────────
@@ -224,16 +263,23 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
     group.add(selGroup);
 
     const buildOverlay = (evt: ConjunctionEvent | null | undefined) => {
-      // remove and dispose previous children
+      // remove and dispose all previous children
       selGroup.children.slice().forEach((c) => {
-        if ((c as THREE.Mesh).geometry) (c as THREE.Mesh).geometry.dispose();
+        const m = c as THREE.Mesh;
+        if (m.geometry) m.geometry.dispose();
+        if (m.material) {
+          if (Array.isArray(m.material)) m.material.forEach((x) => x.dispose());
+          else (m.material as THREE.Material).dispose();
+        }
         selGroup.remove(c);
       });
       if (!evt) return;
 
-      const tier    = getRiskTier(evt.pc_value);
+      const tier = getRiskTier(evt.pc_value);
+      // PRIMARY: tier colour (matches its event-log badge)
+      // SECONDARY: bright cyan — visually distinct from primary at a glance
       const pColour = RISK_COLOUR[tier] ?? 0xef4444;
-      const sColour = 0xff2222; // secondary always red
+      const sColour = 0x00e5ff; // cyan — secondary/debris object
 
       const pLat = evt.primary_lat      ?? noradToLatLon(evt.norad_id)[0];
       const pLon = evt.primary_lon      ?? noradToLatLon(evt.norad_id)[1];
@@ -245,54 +291,81 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
       const posA = geoToVec3(pLat, pLon, pAlt);
       const posB = geoToVec3(sLat, sLon, sAlt);
 
-      const addHighlight = (pos: THREE.Vector3, col: number) => {
-        // 1. Bright white core
+      // Render order: overlay always on top
+      const overlayMat = (colour: number, opacity = 1.0) =>
+        new THREE.MeshBasicMaterial({
+          color: colour,
+          transparent: true,
+          opacity,
+          depthTest:  false,
+          depthWrite: false,
+        });
+
+      const addHighlight = (pos: THREE.Vector3, coreCol: number, ringCol: number, isPrimary: boolean) => {
+        // 1. Core sphere — PRIMARY is white, SECONDARY is cyan so they're
+        //    immediately distinguishable without needing a legend
         const core = new THREE.Mesh(
-          new THREE.SphereGeometry(0.028, 10, 10),
-          new THREE.MeshBasicMaterial({ color: 0xffffff })
+          new THREE.SphereGeometry(0.030, 12, 12),
+          overlayMat(coreCol)
         );
         core.position.copy(pos);
+        core.renderOrder = 999;
         selGroup.add(core);
 
-        // 2. Coloured wireframe halo — breathing opacity via animation
+        // 2. Outer wireframe halo (breathing)
         const halo = new THREE.Mesh(
-          new THREE.SphereGeometry(0.055, 14, 14),
-          new THREE.MeshBasicMaterial({ color: col, wireframe: true, transparent: true, opacity: 0.7 })
+          new THREE.SphereGeometry(0.058, 14, 14),
+          overlayMat(ringCol, 0.7)
         );
+        halo.material.wireframe = true;
         halo.position.copy(pos);
+        halo.renderOrder = 999;
         halo.userData.isHalo = true;
         selGroup.add(halo);
 
-        // 3. Torus ring, oriented outward from Earth — pulsing scale
+        // 3. Torus ring (pulsing) — oriented radially outward from Earth centre
         const ring = new THREE.Mesh(
-          new THREE.TorusGeometry(0.068, 0.008, 8, 48),
-          new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.95 })
+          new THREE.TorusGeometry(isPrimary ? 0.075 : 0.055, 0.009, 8, 48),
+          overlayMat(ringCol, 0.95)
         );
         ring.position.copy(pos);
         ring.quaternion.setFromUnitVectors(
           new THREE.Vector3(0, 0, 1),
           pos.clone().normalize()
         );
+        ring.renderOrder = 999;
         ring.userData.isPulseRing = true;
         selGroup.add(ring);
       };
 
-      addHighlight(posA, pColour);
-      addHighlight(posB, sColour);
+      // Primary: white core, tier-colour ring
+      addHighlight(posA, 0xffffff, pColour, true);
+      // Secondary: cyan core, cyan ring — clearly different from primary
+      addHighlight(posB, 0x00e5ff, sColour, false);
 
-      // 4. Bright red great-circle arc
-      const arcR   = (posA.length() + posB.length()) / 2;
-      selGroup.add(new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(greatCircleArc(posA, posB, arcR)),
-        new THREE.LineBasicMaterial({ color: 0xff0000, transparent: true, opacity: 1.0 })
-      ));
+      // ── Conjunction arc — TubeGeometry so it's visible at any thickness ──
+      // Arc radius floats slightly above both objects so it never clips into
+      // the Earth surface.  depthTest:false means it draws over the globe.
+      const arcR = Math.max(posA.length(), posB.length()) + 0.02;
 
-      // 5. White midpoint dot
-      const mid = new THREE.Mesh(
-        new THREE.SphereGeometry(0.014, 8, 8),
-        new THREE.MeshBasicMaterial({ color: 0xffffff })
+      // Main bright arc
+      const arcTube = buildArcTube(posA, posB, arcR, 0xff3030, 1.0, 0.008);
+      arcTube.userData.isArcTube = true;
+      selGroup.add(arcTube);
+
+      // Softer glow halo around the arc (wider tube, lower opacity)
+      const glowTube = buildArcTube(posA, posB, arcR, 0xff6060, 0.35, 0.016);
+      glowTube.userData.isGlowTube = true;
+      selGroup.add(glowTube);
+
+      // Midpoint warning dot
+      const midPt = posA.clone().lerp(posB, 0.5).normalize().multiplyScalar(arcR);
+      const mid   = new THREE.Mesh(
+        new THREE.SphereGeometry(0.016, 10, 10),
+        overlayMat(0xff3030)
       );
-      mid.position.copy(posA.clone().lerp(posB, 0.5).normalize().multiplyScalar(arcR));
+      mid.position.copy(midPt);
+      mid.renderOrder = 999;
       selGroup.add(mid);
     };
 
@@ -377,11 +450,21 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
       selGroup.children.forEach((child) => {
         const mesh = child as THREE.Mesh;
         if (mesh.userData?.isPulseRing) {
-          mesh.scale.setScalar(1 + 0.30 * Math.sin(t * 4.5));
+          mesh.scale.setScalar(1 + 0.28 * Math.sin(t * 4.5));
         }
         if (mesh.userData?.isHalo) {
           (mesh.material as THREE.MeshBasicMaterial).opacity =
-            0.35 + 0.35 * Math.sin(t * 2.8);
+            0.30 + 0.40 * Math.sin(t * 2.8);
+        }
+        // Pulse the glow tube opacity for a breathing effect
+        if (mesh.userData?.isGlowTube) {
+          (mesh.material as THREE.MeshBasicMaterial).opacity =
+            0.20 + 0.25 * Math.sin(t * 3.2);
+        }
+        // Pulse the main arc tube slightly to attract attention
+        if (mesh.userData?.isArcTube) {
+          (mesh.material as THREE.MeshBasicMaterial).opacity =
+            0.80 + 0.20 * Math.sin(t * 5.0);
         }
       });
 

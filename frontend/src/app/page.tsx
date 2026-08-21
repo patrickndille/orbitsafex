@@ -235,6 +235,7 @@ export default function DashboardPage() {
               { colour: "bg-yellow-500", label: "Elevated" },
               { colour: "bg-green-500",  label: "Monitor" },
               { colour: "bg-slate-400",  label: "Active satellite" },
+              { colour: "bg-cyan-400",   label: "Secondary / debris (selected)" },
             ].map(({ colour, label }) => (
               <span key={label} className="flex items-center gap-1.5">
                 <span className={clsx("w-2 h-2 rounded-full", colour)} />
