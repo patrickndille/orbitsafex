@@ -75,11 +75,13 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(false);
   const [lastScan, setLastScan] = useState<Date | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
+  // selectedEvent — the event whose triage drawer is open (click-locked)
   const [selectedEvent, setSelectedEvent] = useState<ConjunctionEvent | null>(null);
+  // hoveredEvent — transient preview while hovering a table row
   const [hoveredEvent, setHoveredEvent]   = useState<ConjunctionEvent | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
 
-  // Globe always shows the hovered row first; falls back to the open triage event
+  // Globe inset shows the hovered row first; falls back to the click-locked selection
   const globeEvent = hoveredEvent ?? selectedEvent;
 
   const runScan = useCallback(async () => {
@@ -212,30 +214,39 @@ export default function DashboardPage() {
       )}
 
       {/* ── Main content (Globe + Table) ──────────────────────────────── */}
-      <div className="flex-1 grid grid-cols-1 xl:grid-cols-5 gap-4 px-6 pb-6">
+      {/*
+        Key layout constraint: both columns share a fixed-height row so that
+        the globe never grows or shrinks based on the table's row count.
+        - The outer grid is NOT flex-1 / auto-height; it has an explicit height.
+        - On xl screens the two columns sit side-by-side at the same height.
+        - On smaller screens the globe is capped at 420px and the table scrolls.
+      */}
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-4 px-6 pb-6 xl:h-[calc(100vh-13rem)] xl:min-h-[520px]">
 
-        {/* Globe column */}
-        <div className="xl:col-span-2 flex flex-col gap-3">
-          <div className="flex items-center justify-between">
+        {/* Globe column — fixed height, never grows with table */}
+        <div className="xl:col-span-2 flex flex-col gap-3 xl:h-full">
+          <div className="flex items-center justify-between shrink-0">
             <h2 className="text-sm font-semibold text-slate-300 flex items-center gap-2">
               <Globe2 className="w-4 h-4 text-blue-400" />
               LEO Orbital Visualization
             </h2>
-            <span className="text-xs text-slate-600">Drag to rotate · Auto-spin enabled</span>
+            <span className="text-xs text-slate-600 hidden lg:block">Drag to rotate · Auto-spin: display only</span>
           </div>
-          <div className="flex-1 min-h-[380px] xl:min-h-[500px] rounded-xl border border-slate-700/50 overflow-hidden bg-space-900">
+
+          {/* Globe container: fixed height on mobile, fills column on xl */}
+          <div className="h-[420px] xl:h-0 xl:flex-1 rounded-xl border border-slate-700/50 overflow-hidden bg-space-900">
             <GlobeView events={events} selectedEvent={globeEvent} />
           </div>
 
           {/* Legend */}
-          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500 px-1">
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500 px-1 shrink-0">
             {[
               { colour: "bg-red-500",    label: "Critical" },
               { colour: "bg-orange-500", label: "High" },
               { colour: "bg-yellow-500", label: "Elevated" },
               { colour: "bg-green-500",  label: "Monitor" },
               { colour: "bg-slate-400",  label: "Active satellite" },
-              { colour: "bg-cyan-400",   label: "Secondary / debris (selected)" },
+              { colour: "bg-cyan-400",   label: "Secondary (selected)" },
             ].map(({ colour, label }) => (
               <span key={label} className="flex items-center gap-1.5">
                 <span className={clsx("w-2 h-2 rounded-full", colour)} />
@@ -245,22 +256,24 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Table column */}
-        <div className="xl:col-span-3 flex flex-col gap-3">
-          <div className="flex items-center justify-between">
+        {/* Table column — scrolls internally, never pushes the globe */}
+        <div className="xl:col-span-3 flex flex-col gap-3 xl:h-full min-h-[400px]">
+          <div className="flex items-center justify-between shrink-0">
             <h2 className="text-sm font-semibold text-slate-300 flex items-center gap-2">
               <Activity className="w-4 h-4 text-blue-400" />
               Conjunction Event Log
             </h2>
             <span className="text-xs text-slate-600">Sorted by Pc · Click row for AI triage</span>
           </div>
-          <div className="flex-1 min-h-[500px]">
+          {/* h-0 + flex-1 lets the table fill all remaining column height on xl */}
+          <div className="xl:h-0 xl:flex-1 h-[600px]">
             <ConjunctionTable
-              events={events}
-              loading={loading}
-              onSelectEvent={setSelectedEvent}
-              onHoverEvent={setHoveredEvent}
-            />
+               events={events}
+               loading={loading}
+               selectedEvent={selectedEvent}
+               onSelectEvent={setSelectedEvent}
+               onHoverEvent={setHoveredEvent}
+             />
           </div>
         </div>
       </div>

@@ -1,43 +1,41 @@
 "use client";
 
 /**
- * GlobeView.tsx — Three.js 3-D Earth globe
+ * GlobeView.tsx — Three.js 3-D Earth globe + magnified encounter inset
  *
- * Architecture: everything (Earth, nodes, overlay) is added directly to
- * `group` which is the single rotating child of the scene.  selGroup is
- * also a child of `group` so the overlay rotates with the globe.
+ * Two-level visualization:
+ *   1. True-position globe marker — the conjunction midpoint is plotted at its
+ *      real TCA lat/lon.  At Earth scale, 0.40 km separation is sub-pixel;
+ *      one glyph per pair avoids overlap.
  *
- * Selected-conjunction overlay (built by buildOverlay):
- *   Per object (primary + secondary):
- *     • Bright core sphere (PRIMARY=white, SECONDARY=cyan)
- *     • Coloured wireframe halo (breathing opacity)
- *     • Torus ring oriented radially outward (pulsing scale)
- *   Connector:
- *     • TubeGeometry arc (depthTest:false) — always visible over globe
- *     • Animated dashes via opacity pulse
- *     • White midpoint dot
+ *   2. Magnified encounter inset (Canvas 2-D) — always shows two clearly
+ *      separated and labelled objects connected by a bright red dashed line.
+ *      Labelled "Encounter geometry magnified — not to scale".
+ *      No approach-direction arrows are drawn because scalar relative speed
+ *      alone does not determine 3-D approach direction.
  *
- * Why TubeGeometry instead of THREE.Line:
- *   WebGL ignores linewidth > 1, and THREE.Line with depthTest:true is
- *   clipped by the Earth sphere wherever the arc passes through the
- *   globe interior.  A TubeGeometry is a real mesh — it can be rendered
- *   with depthTest:false so it always draws on top of everything.
+ * Scene re-creation strategy:
+ *   The Three.js effect depends only on `events` (the static list).
+ *   The selected-event overlay is updated via a React ref so that hovering
+ *   or clicking a row does NOT recreate the entire scene.
+ *
+ * NOTE: Globe auto-spin is a cosmetic display effect only.
+ *       It does NOT represent the passage of orbital time or satellite motion.
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 import type { ConjunctionEvent } from "@/lib/types";
 import { getRiskTier } from "@/lib/types";
 
-// ── constants ────────────────────────────────────────────────────────────────
+// ── constants ─────────────────────────────────────────────────────────────────
 const DEG        = Math.PI / 180;
 const R_EARTH_KM = 6371;
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 /** lat/lon (deg) + altKm → Three.js XYZ on the scaled globe sphere */
 function geoToVec3(lat: number, lon: number, altKm: number): THREE.Vector3 {
-  // Exaggerate altitude slightly so LEO nodes are clearly above the surface
   const r     = 1 + (altKm / R_EARTH_KM) * 0.8 + 0.06;
   const phi   = (90 - lat)  * DEG;
   const theta = (lon + 180) * DEG;
@@ -46,6 +44,32 @@ function geoToVec3(lat: number, lon: number, altKm: number): THREE.Vector3 {
      r * Math.cos(phi),
      r * Math.sin(phi) * Math.sin(theta)
   );
+}
+
+/**
+ * Geographic midpoint via 3-D unit-vector average.
+ * This correctly handles antimeridian crossing (e.g. 179.9° and -179.9°)
+ * where simple arithmetic averaging would give 0° instead of ±180°.
+ */
+function geoMidpoint(
+  lat1: number, lon1: number,
+  lat2: number, lon2: number,
+): [number, number] {
+  const toXYZ = (latDeg: number, lonDeg: number): [number, number, number] => {
+    const la = latDeg * DEG;
+    const lo = lonDeg * DEG;
+    return [Math.cos(la) * Math.cos(lo), Math.cos(la) * Math.sin(lo), Math.sin(la)];
+  };
+  const [x1, y1, z1] = toXYZ(lat1, lon1);
+  const [x2, y2, z2] = toXYZ(lat2, lon2);
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2;
+  const mz = (z1 + z2) / 2;
+  const r = Math.sqrt(mx * mx + my * my + mz * mz);
+  if (r < 1e-10) return [(lat1 + lat2) / 2, (lon1 + lon2) / 2]; // antipodal fallback
+  const midLat = Math.asin(mz / r) / DEG;
+  const midLon = Math.atan2(my, mx) / DEG;
+  return [midLat, midLon];
 }
 
 /** Deterministic pseudo-random lat/lon from NORAD ID — positional fallback */
@@ -66,14 +90,6 @@ function greatCircleArc(a: THREE.Vector3, b: THREE.Vector3, r: number): THREE.Ve
   );
 }
 
-/**
- * Build a TubeGeometry that follows a great-circle arc.
- * Using TubeGeometry (a real 3-D mesh) instead of THREE.Line because:
- *   • WebGL silently ignores linewidth > 1 — lines are always 1 px
- *   • depthTest:false on a mesh works correctly; on a Line it z-fights badly
- * The tube is rendered with depthTest:false so it draws on top of the globe
- * surface regardless of which side of the Earth the arc passes through.
- */
 function buildArcTube(
   posA: THREE.Vector3,
   posB: THREE.Vector3,
@@ -82,28 +98,35 @@ function buildArcTube(
   opacity: number,
   tubeRadius = 0.006
 ): THREE.Mesh {
-  const pts = greatCircleArc(posA, posB, arcR);
+  const pts  = greatCircleArc(posA, posB, arcR);
   const curve = new THREE.CatmullRomCurve3(pts);
   const geo   = new THREE.TubeGeometry(curve, 80, tubeRadius, 6, false);
   const mat   = new THREE.MeshBasicMaterial({
     color:       colour,
     transparent: true,
-    opacity:     opacity,
-    depthTest:   false,   // ← key: always renders on top of Earth
+    opacity,
+    depthTest:   false,
     depthWrite:  false,
     side:        THREE.DoubleSide,
   });
   const mesh = new THREE.Mesh(geo, mat);
-  mesh.renderOrder = 999; // draw after everything else
+  mesh.renderOrder = 999;
   return mesh;
 }
 
-// ── risk colours ─────────────────────────────────────────────────────────────
+// ── risk colours ──────────────────────────────────────────────────────────────
 const RISK_COLOUR: Record<string, number> = {
   CRITICAL: 0xef4444,
   HIGH:     0xf97316,
   ELEVATED: 0xeab308,
   MONITOR:  0x22c55e,
+};
+
+const RISK_CSS: Record<string, string> = {
+  CRITICAL: "#ef4444",
+  HIGH:     "#f97316",
+  ELEVATED: "#eab308",
+  MONITOR:  "#22c55e",
 };
 
 // ── props ─────────────────────────────────────────────────────────────────────
@@ -112,19 +135,195 @@ interface GlobeViewProps {
   selectedEvent?: ConjunctionEvent | null;
 }
 
-// ── component ────────────────────────────────────────────────────────────────
+// ── EncounterInset — Canvas 2-D magnified encounter overlay ───────────────────
+function EncounterInset({ event }: { event: ConjunctionEvent }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const W = canvas.width;
+    const H = canvas.height;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "rgba(2,7,18,0.92)";
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.strokeStyle = "rgba(239,68,68,0.6)";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(1, 1, W - 2, H - 2);
+
+    const tier    = getRiskTier(event.pc_value);
+    const riskCss = RISK_CSS[tier] ?? "#ef4444";
+
+    const cx      = W / 2;
+    const cy      = H / 2 - 10;
+    const HALF_SEP = 90;
+    const pX = cx - HALF_SEP;
+    const sX = cx + HALF_SEP;
+    const pY = cy;
+    const sY = cy;
+
+    // ── Red dashed connector ──────────────────────────────────────────────────
+    ctx.save();
+    ctx.setLineDash([6, 5]);
+    ctx.strokeStyle = "#ff3030";
+    ctx.lineWidth   = 2;
+    ctx.beginPath();
+    ctx.moveTo(pX + 14, pY);
+    ctx.lineTo(sX - 14, sY);
+    ctx.stroke();
+    ctx.restore();
+
+    // NOTE: No approach-direction arrows are drawn here.
+    // Scalar relative speed (relative_velocity_kms) does not establish
+    // the 3-D approach direction, so drawing arrows would be fabricated.
+
+    // ── PRIMARY marker: white core + risk-colour ring ─────────────────────────
+    ctx.beginPath();
+    ctx.arc(pX, pY, 13, 0, Math.PI * 2);
+    ctx.strokeStyle = riskCss;
+    ctx.lineWidth   = 2.5;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(pX, pY, 9, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+
+    // ── SECONDARY marker: cyan core + cyan ring ───────────────────────────────
+    ctx.beginPath();
+    ctx.arc(sX, sY, 11, 0, Math.PI * 2);
+    ctx.strokeStyle = "#00e5ff";
+    ctx.lineWidth   = 2.5;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(sX, sY, 7, 0, Math.PI * 2);
+    ctx.fillStyle = "#00e5ff";
+    ctx.fill();
+
+    // ── Object labels ─────────────────────────────────────────────────────────
+    const pName = event.sat_name.length > 16
+      ? event.sat_name.substring(0, 15) + "…"
+      : event.sat_name;
+    const sName = event.secondary_name.length > 16
+      ? event.secondary_name.substring(0, 15) + "…"
+      : event.secondary_name;
+
+    ctx.font         = "bold 10px 'Segoe UI', system-ui, sans-serif";
+    ctx.textAlign    = "center";
+    ctx.textBaseline = "middle";
+
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText("PRIMARY", pX, pY - 26);
+    ctx.font      = "9px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillText(pName, pX, pY - 16);
+    ctx.fillText(`#${event.norad_id}`, pX, pY - 6);
+
+    ctx.font      = "bold 10px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillStyle = "#00e5ff";
+    ctx.fillText("SECONDARY", sX, sY - 26);
+    ctx.font      = "9px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillText(sName, sX, sY - 16);
+    ctx.fillText(`#${event.secondary_norad_id}`, sX, sY - 6);
+
+    // ── Metrics strip ─────────────────────────────────────────────────────────
+    const metricsY = cy + 30;
+    ctx.font         = "bold 11px 'Segoe UI', system-ui, sans-serif";
+    ctx.textAlign    = "center";
+    ctx.fillStyle    = riskCss;
+    ctx.fillText(`Predicted miss: ${event.miss_distance_km.toFixed(2)} km`, cx, metricsY);
+
+    const tcaStr = event.tca_iso
+      ? `TCA: ${event.tca_iso.replace("T", " ").replace("Z", " UTC")}`
+      : "";
+    if (tcaStr) {
+      ctx.font      = "10px 'Segoe UI', system-ui, sans-serif";
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText(tcaStr, cx, metricsY + 14);
+    }
+
+    // ── Tier badge ────────────────────────────────────────────────────────────
+    const badgeW = 68;
+    const badgeH = 18;
+    const badgeX = cx - badgeW / 2;
+    const badgeY = metricsY + 28;
+    ctx.fillStyle   = riskCss + "30";
+    ctx.strokeStyle = riskCss;
+    ctx.lineWidth   = 1;
+    ctx.beginPath();
+    ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
+    ctx.fill();
+    ctx.stroke();
+    ctx.font         = "bold 9px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillStyle    = riskCss;
+    ctx.textAlign    = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(tier, cx, badgeY + badgeH / 2);
+
+    // ── Scale disclaimer ──────────────────────────────────────────────────────
+    ctx.font         = "italic 8.5px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillStyle    = "#475569";
+    ctx.textAlign    = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("Encounter geometry magnified — not to scale", cx, H - 10);
+
+    // ── Title ─────────────────────────────────────────────────────────────────
+    ctx.font         = "bold 9px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillStyle    = "#64748b";
+    ctx.textAlign    = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText("CLOSE APPROACH DETAIL", 8, 7);
+  }, [event]);
+
+  useEffect(() => { draw(); }, [draw]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={420}
+      height={200}
+      className="w-full rounded-lg border border-red-900/40"
+      style={{ display: "block" }}
+    />
+  );
+}
+
+// ── component ─────────────────────────────────────────────────────────────────
 export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
   const mountRef    = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const frameRef    = useRef<number>(0);
 
+  // Hold latest selectedEvent in a ref so the animation loop and overlay
+  // update function can access it without triggering scene recreation.
+  const selectedEventRef = useRef<ConjunctionEvent | null | undefined>(selectedEvent);
+  selectedEventRef.current = selectedEvent;
+
+  // selGroupRef lets the overlay-update effect reach the Three.js group
+  // that was created in the scene-setup effect.
+  const selGroupRef    = useRef<THREE.Group | null>(null);
+  // Expose the buildOverlay function so the second effect can call it.
+  const buildOverlayFn = useRef<((evt: ConjunctionEvent | null | undefined) => void) | null>(null);
+
+  // Camera snap target shared between Effect 1 (writes initial value,
+  // reads every animation frame) and Effect 2 (writes when selectedEvent
+  // changes).  Using a plain object ref avoids any React re-render cost.
+  const snapRef = useRef<{ rotY: number; rotX: number; active: boolean }>({
+    rotY: 0, rotX: 0, active: false,
+  });
+
+  // ── Effect 1: build the static Three.js scene (depends only on `events`) ──
   useEffect(() => {
     if (!mountRef.current) return;
     const container = mountRef.current;
     const W = container.clientWidth  || 600;
     const H = container.clientHeight || 400;
 
-    // ── scene / camera / renderer ─────────────────────────────────────────
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x020712);
 
@@ -137,17 +336,15 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // ── lights ────────────────────────────────────────────────────────────
     const sunLight = new THREE.DirectionalLight(0xffffff, 2.2);
     sunLight.position.set(5, 3, 5);
     scene.add(sunLight);
     scene.add(new THREE.AmbientLight(0x1a2a4a, 1.2));
 
-    // ── single rotation group (the globe + all overlays live here) ────────
     const group = new THREE.Group();
     scene.add(group);
 
-    // ── stars ─────────────────────────────────────────────────────────────
+    // Stars
     const starVerts: number[] = [];
     for (let i = 0; i < 6000; i++) {
       const r  = 80 + Math.random() * 120;
@@ -163,7 +360,7 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
     starGeo.setAttribute("position", new THREE.Float32BufferAttribute(starVerts, 3));
     group.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 0.18 })));
 
-    // ── Earth sphere ──────────────────────────────────────────────────────
+    // Earth sphere
     group.add(new THREE.Mesh(
       new THREE.SphereGeometry(1, 64, 64),
       new THREE.MeshPhongMaterial({
@@ -172,7 +369,7 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
       })
     ));
 
-    // continent patches
+    // Continent patches
     const cMat = new THREE.MeshPhongMaterial({ color: 0x2d6a2d, emissive: 0x0f2b0f, shininess: 10 });
     ([ [40,-100,50,65],[-15,-55,45,45],[10,20,60,40],[50,20,40,60],[30,80,40,60],[-25,135,30,30] ] as
       [number,number,number,number][]).forEach(([lat, lon, latS, lonS]) => {
@@ -184,7 +381,7 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
       ));
     });
 
-    // atmosphere
+    // Atmosphere
     group.add(new THREE.Mesh(
       new THREE.SphereGeometry(1.06, 32, 32),
       new THREE.MeshPhongMaterial({
@@ -201,7 +398,7 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
     leoRing.rotation.x = Math.PI / 2;
     group.add(leoRing);
 
-    // ── background satellite dots ─────────────────────────────────────────
+    // Background satellite dots
     const satGeo = new THREE.SphereGeometry(0.008, 6, 6);
     const satMat = new THREE.MeshBasicMaterial({ color: 0x94a3b8 });
     for (let i = 0; i < 60; i++) {
@@ -210,60 +407,48 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
       group.add(dot);
     }
 
-    // ── conjunction event nodes (primary + secondary of every event) ──────
-    // Both objects in a conjunction pair are plotted so the secondary is always
-    // visible on the globe even when it isn't the primary of another event.
+    // Conjunction event nodes — single midpoint glyph per pair
     const eventNodes: THREE.Mesh[] = [];
     events.slice(0, 60).forEach((evt) => {
       const tier   = getRiskTier(evt.pc_value);
       const colour = RISK_COLOUR[tier] ?? 0xffffff;
 
-      // ── Primary node ──
       const pLat = evt.primary_lat    ?? noradToLatLon(evt.norad_id)[0];
       const pLon = evt.primary_lon    ?? noradToLatLon(evt.norad_id)[1];
       const pAlt = evt.primary_alt_km ?? 400;
-
-      const primaryNode = new THREE.Mesh(
-        new THREE.SphereGeometry(0.018, 8, 8),
-        new THREE.MeshBasicMaterial({ color: colour })
-      );
-      primaryNode.position.copy(geoToVec3(pLat, pLon, pAlt));
-      primaryNode.userData = { basePc: evt.pc_value, phase: Math.random() * Math.PI * 2 };
-      group.add(primaryNode);
-      eventNodes.push(primaryNode);
-
-      // faint orbit-arc suggestion for primary
-      const arcPts: THREE.Vector3[] = [];
-      for (let a = 0; a <= 360; a += 4) {
-        arcPts.push(geoToVec3(pLat * Math.cos(a * DEG * 0.5), pLon + a * 0.6, pAlt));
-      }
-      group.add(new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(arcPts),
-        new THREE.LineBasicMaterial({ color: colour, transparent: true, opacity: 0.22 })
-      ));
-
-      // ── Secondary node (smaller diamond-ish sphere, same tier colour) ──
       const sLat = evt.secondary_lat    ?? noradToLatLon(evt.secondary_norad_id)[0];
       const sLon = evt.secondary_lon    ?? noradToLatLon(evt.secondary_norad_id)[1];
       const sAlt = evt.secondary_alt_km ?? 400;
 
-      const secondaryNode = new THREE.Mesh(
-        new THREE.SphereGeometry(0.013, 8, 8),           // smaller than primary
-        new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: 0.75 })
+      // Use 3-D unit-vector midpoint to avoid antimeridian averaging error
+      const [midLat, midLon] = geoMidpoint(pLat, pLon, sLat, sLon);
+      const midAlt = (pAlt + sAlt) / 2;
+
+      const node = new THREE.Mesh(
+        new THREE.SphereGeometry(0.018, 8, 8),
+        new THREE.MeshBasicMaterial({ color: colour })
       );
-      secondaryNode.position.copy(geoToVec3(sLat, sLon, sAlt));
-      secondaryNode.userData = { basePc: evt.pc_value, phase: Math.random() * Math.PI * 2 };
-      group.add(secondaryNode);
-      eventNodes.push(secondaryNode);
+      node.position.copy(geoToVec3(midLat, midLon, midAlt));
+      node.userData = { basePc: evt.pc_value, phase: Math.random() * Math.PI * 2 };
+      group.add(node);
+      eventNodes.push(node);
+
+      const arcPts: THREE.Vector3[] = [];
+      for (let a = 0; a <= 360; a += 4) {
+        arcPts.push(geoToVec3(midLat * Math.cos(a * DEG * 0.5), midLon + a * 0.6, midAlt));
+      }
+      group.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(arcPts),
+        new THREE.LineBasicMaterial({ color: colour, transparent: true, opacity: 0.18 })
+      ));
     });
 
-    // ── selected-conjunction overlay ──────────────────────────────────────
-    // selGroup is a child of `group` so it rotates with the globe.
+    // Selected-conjunction overlay group (updated without scene recreation)
     const selGroup = new THREE.Group();
     group.add(selGroup);
+    selGroupRef.current = selGroup;
 
     const buildOverlay = (evt: ConjunctionEvent | null | undefined) => {
-      // remove and dispose all previous children
       selGroup.children.slice().forEach((c) => {
         const m = c as THREE.Mesh;
         if (m.geometry) m.geometry.dispose();
@@ -275,143 +460,105 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
       });
       if (!evt) return;
 
-      const tier = getRiskTier(evt.pc_value);
-      // PRIMARY: tier colour (matches its event-log badge)
-      // SECONDARY: bright cyan — visually distinct from primary at a glance
+      const tier    = getRiskTier(evt.pc_value);
       const pColour = RISK_COLOUR[tier] ?? 0xef4444;
-      const sColour = 0x00e5ff; // cyan — secondary/debris object
 
-      const pLat = evt.primary_lat      ?? noradToLatLon(evt.norad_id)[0];
-      const pLon = evt.primary_lon      ?? noradToLatLon(evt.norad_id)[1];
-      const pAlt = evt.primary_alt_km   ?? 400;
-      const sLat = evt.secondary_lat    ?? noradToLatLon(evt.secondary_norad_id)[0];
-      const sLon = evt.secondary_lon    ?? noradToLatLon(evt.secondary_norad_id)[1];
+      const pLat = evt.primary_lat    ?? noradToLatLon(evt.norad_id)[0];
+      const pLon = evt.primary_lon    ?? noradToLatLon(evt.norad_id)[1];
+      const pAlt = evt.primary_alt_km ?? 400;
+      const sLat = evt.secondary_lat  ?? noradToLatLon(evt.secondary_norad_id)[0];
+      const sLon = evt.secondary_lon  ?? noradToLatLon(evt.secondary_norad_id)[1];
       const sAlt = evt.secondary_alt_km ?? 400;
+
+      // 3-D unit-vector midpoint — correct across the antimeridian
+      const [midLat, midLon] = geoMidpoint(pLat, pLon, sLat, sLon);
+      const midAlt = (pAlt + sAlt) / 2;
+      const midPos = geoToVec3(midLat, midLon, midAlt);
+
+      const overlayMat = (colour: number, opacity = 1.0) =>
+        new THREE.MeshBasicMaterial({
+          color: colour, transparent: true, opacity,
+          depthTest: false, depthWrite: false,
+        });
+
+      const core = new THREE.Mesh(new THREE.SphereGeometry(0.032, 12, 12), overlayMat(0xffffff));
+      core.position.copy(midPos);
+      core.renderOrder = 999;
+      selGroup.add(core);
+
+      const halo = new THREE.Mesh(new THREE.SphereGeometry(0.062, 14, 14), overlayMat(pColour, 0.7));
+      (halo.material as THREE.MeshBasicMaterial).wireframe = true;
+      halo.position.copy(midPos);
+      halo.renderOrder = 999;
+      halo.userData.isHalo = true;
+      selGroup.add(halo);
+
+      const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(0.080, 0.010, 8, 48),
+        overlayMat(pColour, 0.95)
+      );
+      ring.position.copy(midPos);
+      ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), midPos.clone().normalize());
+      ring.renderOrder = 999;
+      ring.userData.isPulseRing = true;
+      selGroup.add(ring);
 
       const posA = geoToVec3(pLat, pLon, pAlt);
       const posB = geoToVec3(sLat, sLon, sAlt);
-
-      // Render order: overlay always on top
-      const overlayMat = (colour: number, opacity = 1.0) =>
-        new THREE.MeshBasicMaterial({
-          color: colour,
-          transparent: true,
-          opacity,
-          depthTest:  false,
-          depthWrite: false,
-        });
-
-      const addHighlight = (pos: THREE.Vector3, coreCol: number, ringCol: number, isPrimary: boolean) => {
-        // 1. Core sphere — PRIMARY is white, SECONDARY is cyan so they're
-        //    immediately distinguishable without needing a legend
-        const core = new THREE.Mesh(
-          new THREE.SphereGeometry(0.030, 12, 12),
-          overlayMat(coreCol)
-        );
-        core.position.copy(pos);
-        core.renderOrder = 999;
-        selGroup.add(core);
-
-        // 2. Outer wireframe halo (breathing)
-        const halo = new THREE.Mesh(
-          new THREE.SphereGeometry(0.058, 14, 14),
-          overlayMat(ringCol, 0.7)
-        );
-        halo.material.wireframe = true;
-        halo.position.copy(pos);
-        halo.renderOrder = 999;
-        halo.userData.isHalo = true;
-        selGroup.add(halo);
-
-        // 3. Torus ring (pulsing) — oriented radially outward from Earth centre
-        const ring = new THREE.Mesh(
-          new THREE.TorusGeometry(isPrimary ? 0.075 : 0.055, 0.009, 8, 48),
-          overlayMat(ringCol, 0.95)
-        );
-        ring.position.copy(pos);
-        ring.quaternion.setFromUnitVectors(
-          new THREE.Vector3(0, 0, 1),
-          pos.clone().normalize()
-        );
-        ring.renderOrder = 999;
-        ring.userData.isPulseRing = true;
-        selGroup.add(ring);
-      };
-
-      // Primary: white core, tier-colour ring
-      addHighlight(posA, 0xffffff, pColour, true);
-      // Secondary: cyan core, cyan ring — clearly different from primary
-      addHighlight(posB, 0x00e5ff, sColour, false);
-
-      // ── Conjunction arc — TubeGeometry so it's visible at any thickness ──
-      // Arc radius floats slightly above both objects so it never clips into
-      // the Earth surface.  depthTest:false means it draws over the globe.
       const arcR = Math.max(posA.length(), posB.length()) + 0.02;
 
-      // Main bright arc
       const arcTube = buildArcTube(posA, posB, arcR, 0xff3030, 1.0, 0.008);
       arcTube.userData.isArcTube = true;
       selGroup.add(arcTube);
 
-      // Softer glow halo around the arc (wider tube, lower opacity)
       const glowTube = buildArcTube(posA, posB, arcR, 0xff6060, 0.35, 0.016);
       glowTube.userData.isGlowTube = true;
       selGroup.add(glowTube);
-
-      // Midpoint warning dot
-      const midPt = posA.clone().lerp(posB, 0.5).normalize().multiplyScalar(arcR);
-      const mid   = new THREE.Mesh(
-        new THREE.SphereGeometry(0.016, 10, 10),
-        overlayMat(0xff3030)
-      );
-      mid.position.copy(midPt);
-      mid.renderOrder = 999;
-      selGroup.add(mid);
     };
 
-    buildOverlay(selectedEvent);
+    // Expose to the selectedEvent effect
+    buildOverlayFn.current = buildOverlay;
 
-    // ── camera snap-to ────────────────────────────────────────────────────
-    // geoToVec3 bakes theta = (lon + 180)°, so a point at longitude L lands at
-    // theta = (L+180)°.  The camera sits at +Z; to bring longitude M to the
-    // front hemisphere we need the group rotated so that theta + rotY = 90°:
-    //   rotY = 90° - (M + 180)° = -(M + 90)° = -(M * DEG) - PI/2
-    let targetRotY = 0;
-    let targetRotX = 0;
-    if (selectedEvent) {
-      const pLat = selectedEvent.primary_lat   ?? noradToLatLon(selectedEvent.norad_id)[0];
-      const pLon = selectedEvent.primary_lon   ?? noradToLatLon(selectedEvent.norad_id)[1];
-      const sLat = selectedEvent.secondary_lat ?? noradToLatLon(selectedEvent.secondary_norad_id)[0];
-      const sLon = selectedEvent.secondary_lon ?? noradToLatLon(selectedEvent.secondary_norad_id)[1];
-      const midLon = (pLon + sLon) / 2;
-      const midLat = (pLat + sLat) / 2;
-      targetRotY = -(midLon * DEG) - Math.PI / 2;
-      targetRotX = -(midLat * DEG) * 0.7;
+    // Draw initial overlay from the current ref value
+    buildOverlay(selectedEventRef.current);
+
+    // Point snap ref at the shared object — read by animation loop each frame.
+    // This avoids storing snap state on the Three.js group (which would require
+    // casting through _snapTarget and is unreliable across effect teardowns).
+    const snap = snapRef.current;
+
+    // Compute initial snap from current selectedEvent ref
+    const initEvt = selectedEventRef.current;
+    if (initEvt) {
+      const pLat = initEvt.primary_lat   ?? noradToLatLon(initEvt.norad_id)[0];
+      const pLon = initEvt.primary_lon   ?? noradToLatLon(initEvt.norad_id)[1];
+      const sLat = initEvt.secondary_lat ?? noradToLatLon(initEvt.secondary_norad_id)[0];
+      const sLon = initEvt.secondary_lon ?? noradToLatLon(initEvt.secondary_norad_id)[1];
+      const [midLat, midLon] = geoMidpoint(pLat, pLon, sLat, sLon);
+      snap.rotY   = -(midLon * DEG) - Math.PI / 2;
+      snap.rotX   = -(midLat * DEG) * 0.7;
+      snap.active = true;
     }
 
-    // ── mouse drag ────────────────────────────────────────────────────────
+    // Mouse drag
     let isDragging = false;
     let prevX = 0, prevY = 0;
 
-    const onDown = (e: MouseEvent) => {
-      isDragging = true; prevX = e.clientX; prevY = e.clientY;
-    };
-    const onUp = () => { isDragging = false; };
+    const onDown = (e: MouseEvent) => { isDragging = true; prevX = e.clientX; prevY = e.clientY; };
+    const onUp   = () => { isDragging = false; };
     const onMove = (e: MouseEvent) => {
       if (!isDragging) return;
       group.rotation.y += (e.clientX - prevX) * 0.005;
       group.rotation.x += (e.clientY - prevY) * 0.003;
       group.rotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, group.rotation.x));
-      // Sync snap target so lerp doesn't fight the user after dragging
-      targetRotY = group.rotation.y;
-      targetRotX = group.rotation.x;
+      snap.rotY = group.rotation.y;
+      snap.rotX = group.rotation.x;
       prevX = e.clientX; prevY = e.clientY;
     };
     container.addEventListener("mousedown", onDown);
     window.addEventListener("mouseup", onUp);
     window.addEventListener("mousemove", onMove);
 
-    // ── resize ────────────────────────────────────────────────────────────
     const onResize = () => {
       const w = container.clientWidth;
       const h = container.clientHeight;
@@ -421,23 +568,22 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
     };
     window.addEventListener("resize", onResize);
 
-    // ── animation loop ────────────────────────────────────────────────────
+    // Animation loop
+    // NOTE: auto-spin is cosmetic only — not time propagation.
     let t = 0;
     const animate = () => {
       frameRef.current = requestAnimationFrame(animate);
       t += 0.016;
 
-      // Rotation
       if (!isDragging) {
-        if (selectedEvent) {
-          group.rotation.y += (targetRotY - group.rotation.y) * 0.05;
-          group.rotation.x += (targetRotX - group.rotation.x) * 0.05;
+        if (snap.active) {
+          group.rotation.y += (snap.rotY - group.rotation.y) * 0.05;
+          group.rotation.x += (snap.rotX - group.rotation.x) * 0.05;
         } else {
           group.rotation.y += 0.0015;
         }
       }
 
-      // Pulse high-risk event nodes
       eventNodes.forEach((node) => {
         const { basePc, phase } = node.userData as { basePc: number; phase: number };
         const tier = getRiskTier(basePc);
@@ -446,33 +592,21 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
         }
       });
 
-      // Animate selection overlay
       selGroup.children.forEach((child) => {
         const mesh = child as THREE.Mesh;
-        if (mesh.userData?.isPulseRing) {
-          mesh.scale.setScalar(1 + 0.28 * Math.sin(t * 4.5));
-        }
-        if (mesh.userData?.isHalo) {
-          (mesh.material as THREE.MeshBasicMaterial).opacity =
-            0.30 + 0.40 * Math.sin(t * 2.8);
-        }
-        // Pulse the glow tube opacity for a breathing effect
-        if (mesh.userData?.isGlowTube) {
-          (mesh.material as THREE.MeshBasicMaterial).opacity =
-            0.20 + 0.25 * Math.sin(t * 3.2);
-        }
-        // Pulse the main arc tube slightly to attract attention
-        if (mesh.userData?.isArcTube) {
-          (mesh.material as THREE.MeshBasicMaterial).opacity =
-            0.80 + 0.20 * Math.sin(t * 5.0);
-        }
+        if (mesh.userData?.isPulseRing) mesh.scale.setScalar(1 + 0.28 * Math.sin(t * 4.5));
+        if (mesh.userData?.isHalo)
+          (mesh.material as THREE.MeshBasicMaterial).opacity = 0.30 + 0.40 * Math.sin(t * 2.8);
+        if (mesh.userData?.isGlowTube)
+          (mesh.material as THREE.MeshBasicMaterial).opacity = 0.20 + 0.25 * Math.sin(t * 3.2);
+        if (mesh.userData?.isArcTube)
+          (mesh.material as THREE.MeshBasicMaterial).opacity = 0.80 + 0.20 * Math.sin(t * 5.0);
       });
 
       renderer.render(scene, camera);
     };
     animate();
 
-    // ── cleanup ───────────────────────────────────────────────────────────
     return () => {
       cancelAnimationFrame(frameRef.current);
       window.removeEventListener("resize", onResize);
@@ -480,15 +614,49 @@ export default function GlobeView({ events, selectedEvent }: GlobeViewProps) {
       window.removeEventListener("mouseup", onUp);
       window.removeEventListener("mousemove", onMove);
       renderer.dispose();
+      buildOverlayFn.current = null;
+      selGroupRef.current    = null;
       if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
     };
-  }, [events, selectedEvent]);
+  }, [events]); // ← only `events`; selectedEvent changes do NOT recreate the scene
+
+  // ── Effect 2: update overlay when selectedEvent changes (no scene rebuild) ──
+  useEffect(() => {
+    // Update the encounter overlay (canvas 2-D inset is handled by React
+    // rendering EncounterInset below; this updates the Three.js globe glyph).
+    if (buildOverlayFn.current) {
+      buildOverlayFn.current(selectedEvent);
+    }
+
+    // Update camera snap target via the shared ref — directly accessible from
+    // both this effect and the animation loop without any scene traversal.
+    if (selectedEvent) {
+      const pLat = selectedEvent.primary_lat   ?? noradToLatLon(selectedEvent.norad_id)[0];
+      const pLon = selectedEvent.primary_lon   ?? noradToLatLon(selectedEvent.norad_id)[1];
+      const sLat = selectedEvent.secondary_lat ?? noradToLatLon(selectedEvent.secondary_norad_id)[0];
+      const sLon = selectedEvent.secondary_lon ?? noradToLatLon(selectedEvent.secondary_norad_id)[1];
+      const [midLat, midLon] = geoMidpoint(pLat, pLon, sLat, sLon);
+      snapRef.current.rotY   = -(midLon * DEG) - Math.PI / 2;
+      snapRef.current.rotX   = -(midLat * DEG) * 0.7;
+      snapRef.current.active = true;
+    } else {
+      snapRef.current.active = false;
+    }
+  }, [selectedEvent]);
 
   return (
-    <div
-      ref={mountRef}
-      className="w-full h-full rounded-xl overflow-hidden cursor-grab active:cursor-grabbing"
-      style={{ minHeight: "420px" }}
-    />
+    <div className="w-full h-full flex flex-col">
+      <div
+        ref={mountRef}
+        className="flex-1 rounded-t-xl overflow-hidden cursor-grab active:cursor-grabbing"
+        style={{ minHeight: "280px" }}
+      />
+
+      {selectedEvent && (
+        <div className="px-3 pb-3 pt-2 bg-space-950/80 rounded-b-xl border-t border-red-900/30">
+          <EncounterInset event={selectedEvent} />
+        </div>
+      )}
+    </div>
   );
 }

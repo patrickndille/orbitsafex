@@ -111,15 +111,23 @@ async def scan_conjunctions(max_objects: int = 400):
     Trigger a full orbital scan.
 
     Fetches GP data from Space-Track.org (3-hour cache, local fallback),
-    runs SGP4 forward-propagation on KD-Tree pre-filtered LEO pairs, and
-    returns a list of conjunction events sorted by descending Pc.
+    runs SGP4 forward-propagation on spatiotemporal-prefiltered LEO pairs,
+    and returns a list of conjunction events sorted by descending Pc.
+
+    scan_metadata is returned at the top level (not duplicated per event)
+    and includes coverage statistics and explicit prefilter limitations.
     """
     try:
         from services.orbital_math import run_conjunction_scan
-        events = run_conjunction_scan(max_objects=max_objects)
+        events, scan_metadata = run_conjunction_scan(max_objects=max_objects)
         scan_id = save_scan(events)
         logger.info("Scan persisted as scan_id=%d (%d events).", scan_id, len(events))
-        return {"scan_id": scan_id, "count": len(events), "events": events}
+        return {
+            "scan_id":       scan_id,
+            "count":         len(events),
+            "events":        events,
+            "scan_metadata": scan_metadata,
+        }
     except Exception as exc:
         logger.exception("Conjunction scan failed.")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -155,39 +163,58 @@ async def triage_conjunction(data: ConjunctionData):
     """
     AI-powered triage for a specific conjunction event.
 
-    Accepts conjunction metrics and returns a natural-language
-    risk assessment and evasive maneuver recommendation from the LLM.
+    Accepts conjunction metrics and returns a natural-language risk assessment.
+    The LLM explains and contextualises the metrics; it does NOT calculate or
+    invent collision probability.  All recommendations are advisory only and
+    require flight-dynamics team authorisation before any maneuver is executed.
     """
     risk_tier = (
-        "CRITICAL (immediate action required)"
+        "CRITICAL (Pc ≥ 1×10⁻⁴)"
         if data.pc_value >= 1e-4
-        else "HIGH" if data.pc_value >= 1e-5
-        else "ELEVATED" if data.pc_value >= 1e-6
-        else "MONITOR"
+        else "HIGH (Pc ≥ 1×10⁻⁵)" if data.pc_value >= 1e-5
+        else "ELEVATED (Pc ≥ 1×10⁻⁶)" if data.pc_value >= 1e-6
+        else "MONITOR (Pc < 1×10⁻⁶)"
     )
 
     messages = [
         SystemMessage(
             content=(
-                "You are an expert Space Operations AI specialising in satellite "
-                "conjunction triage and orbital mechanics. Your role is to give "
-                "mission operators concise, actionable recommendations based on "
-                "Probability of Collision (Pc), miss distance, and relative velocity. "
-                "Structure your response with: (1) Risk Assessment, (2) Physical "
-                "Context, (3) Recommended Evasive Maneuver, (4) Urgency Timeline."
+                "You are an expert Space Operations AI assistant specialising in "
+                "satellite conjunction triage and orbital mechanics. "
+                "\n\nCRITICAL CONSTRAINTS — you MUST follow these:\n"
+                "1. The Probability of Collision (Pc) value you are given is a "
+                "SCREENING ESTIMATE computed using assumed isotropic positional "
+                "uncertainty (σ=200 m) and a simplified 2-D Gaussian integral. "
+                "It is NOT a CDM-quality operational Pc. Do not present it as "
+                "definitive or authoritative.\n"
+                "2. Do NOT describe the event as a guaranteed collision. Use "
+                "language such as 'predicted close approach', 'screening Pc', "
+                "or 'probability of collision estimate'.\n"
+                "3. Do NOT recommend executing a maneuver directly. Use language "
+                "such as 'candidate maneuver for flight-dynamics review' or "
+                "'recommended for assessment by qualified personnel'.\n"
+                "4. Always include the mandatory advisory: "
+                "'All maneuver decisions require object-specific covariance/CDM "
+                "data and review by a qualified flight-dynamics team.'\n"
+                "5. Structure your response with: (1) Risk Assessment, "
+                "(2) Physical Context, (3) Candidate Maneuver Options, "
+                "(4) Recommended Next Steps."
             )
         ),
         HumanMessage(
             content=(
-                f"Triage request for conjunction event:\n"
-                f"  Primary Satellite : {data.sat_name} (NORAD #{data.norad_id})\n"
-                f"  Miss Distance     : {data.miss_distance_km:.3f} km\n"
-                f"  Relative Velocity : {data.relative_velocity_kms:.3f} km/s\n"
-                f"  Probability of Collision (Pc): {data.pc_value:.3e}\n"
-                f"  Risk Tier         : {risk_tier}\n\n"
-                "Provide a concise operational summary and recommended evasive "
-                "maneuver burn direction and delta-V estimate. Assume a standard "
-                "LEO spacecraft with a ~1 N hydrazine thruster."
+                f"Triage request for predicted close approach (conjunction event):\n"
+                f"  Primary Satellite          : {data.sat_name} (NORAD #{data.norad_id})\n"
+                f"  Miss Distance at TCA       : {data.miss_distance_km:.3f} km\n"
+                f"  Relative Velocity at TCA   : {data.relative_velocity_kms:.3f} km/s\n"
+                f"  Screening Pc (est.)        : {data.pc_value:.3e}\n"
+                f"    (assumed σ=200 m isotropic; not CDM-quality)\n"
+                f"  Risk Tier                  : {risk_tier}\n\n"
+                "Provide a concise operational summary and candidate evasive "
+                "maneuver direction and delta-V estimate for flight-dynamics review. "
+                "Assume a standard LEO spacecraft with a ~1 N hydrazine thruster. "
+                "Remind the operator that authoritative maneuver decisions require "
+                "object-specific covariance data and CDM analysis."
             )
         ),
     ]
@@ -199,6 +226,13 @@ async def triage_conjunction(data: ConjunctionData):
             "sat_name": data.sat_name,
             "risk_tier": risk_tier,
             "pc_value": data.pc_value,
+            "pc_method": "screening-isotropic-gaussian",
+            "pc_assumed_sigma_m": 200.0,
+            "advisory": (
+                "AI recommendations are advisory only. All maneuver decisions "
+                "require object-specific covariance/CDM data and review by a "
+                "qualified flight-dynamics team."
+            ),
             "summary": response.content,
         }
     except Exception as exc:

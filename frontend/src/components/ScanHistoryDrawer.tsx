@@ -199,6 +199,11 @@ export default function ScanHistoryDrawer({ open, onClose, onLoadScan }: Props) 
                           <div className="text-slate-500">
                             vs {evt.secondary_name} · {evt.miss_distance_km.toFixed(2)} km miss
                           </div>
+                          {evt.position_source === "legacy-fallback" && (
+                            <div className="text-amber-600 mt-0.5 text-[10px]">
+                              ⚠ Globe position unavailable (pre-v2 scan)
+                            </div>
+                          )}
                         </div>
                       );
                     })}

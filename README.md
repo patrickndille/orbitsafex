@@ -48,12 +48,14 @@ OrbitSafe AI is a full-stack space situational awareness (SSA) platform:
 |---|---|
 | **Space-Track.org Ingestion** | Authenticates against the authoritative USSF/18 SDS GP catalog via session cookies, fetches live OMM/JSON element sets, and maintains a local disk fallback for offline resilience |
 | **SGP4 Propagation** | Propagates every GP record forward using the `sgp4` library to compute current ECI position/velocity and find the Time of Closest Approach |
-| **$P_c$ Engine** | Computes the Probability of Collision by integrating a bivariate Gaussian over the combined hard-body cross-section in the encounter plane (Alfano 2-D method) |
-| **KD-Tree Pre-filter** | Limits $O(n^2)$ brute-force checking to an $O(n \log n)$ spatial query — only pairs within 100 km in ECI coordinates proceed to full SGP4 analysis |
-| **SQLite Persistence** | Every completed scan is stored in a local SQLite database (`orbitsafe.db`), enabling full historical scan review without data loss |
-| **FastAPI Backend** | Exposes async REST endpoints for scanning, AI triage, and scan history retrieval |
-| **LangChain + LLM** | Routes conjunction metrics to a ChatOpenAI-compatible model to generate structured, rendered Markdown + LaTeX evasive maneuver recommendations |
-| **Next.js Dashboard** | Renders a responsive operator UI with a live 3-D Earth globe, a searchable/filterable conjunction table, a slide-in AI triage drawer, and a scan history panel |
+| **Screening $P_c$ Engine** | Computes a Screening Probability of Collision using an isotropic 2-D Gaussian integral (Alfano/Patera method, assumed σ=200 m). This is a screening estimate, not a CDM-quality operational Pc. |
+| **Spatiotemporal Prefilter** | Propagates all satellites at 5-minute coarse intervals over the 24-hour window; builds a KD-Tree at each epoch to collect pairs that pass within 100 km at ANY future time — not just at t₀. This finds future-converging pairs that a snapshot filter would miss. |
+| **Stratified Altitude Sampling** | When capping the evaluated object count, samples proportionally across 50-km altitude bins (300–1200 km) rather than truncating the sorted-by-altitude list, ensuring full-band coverage. |
+| **Epoch-Aware Geodetic Conversion** | Converts SGP4 TEME/ECI output to Earth-fixed geographic coordinates using GMST at TCA, so globe positions reflect actual sub-satellite ground tracks. |
+| **SQLite Persistence** | Every completed scan is stored with full TCA position fields (`primary_lat/lon/alt`, `secondary_lat/lon/alt`, `position_source`). Schema is idempotently migrated on startup. |
+| **FastAPI Backend** | Exposes async REST endpoints for scanning, AI triage, and scan history retrieval. |
+| **LangChain + LLM** | Routes conjunction metrics to a ChatOpenAI-compatible model to generate structured advisory Markdown + LaTeX recommendations. The LLM explains and contextualises the metrics — it does NOT calculate or invent collision probability. |
+| **Next.js Dashboard** | Renders a responsive operator UI with a live 3-D Earth globe, magnified encounter inset, a searchable/filterable conjunction table, a slide-in AI triage drawer, and a scan history panel. |
 
 ---
 
@@ -91,18 +93,23 @@ OrbitSafe AI is a full-stack space situational awareness (SSA) platform:
         ┌─────────────▼──────────┐  ┌─────────▼───────────────┐
         │   orbital_math.py      │  │  LangChain / ChatOpenAI  │
         │                        │  │                           │
-        │  ① Space-Track fetch   │  │  SystemMessage (expert   │
-        │  ② LEO altitude filter │  │    ops assistant)        │
-        │  ③ KD-Tree pre-filter  │  │  HumanMessage (metrics)  │
-        │  ④ SGP4 propagation    │  │  → structured Markdown + │
-        │  ⑤ TCA bisection       │  │    LaTeX recommendation  │
-        │  ⑥ Pc 2-D integration  │  └─────────────────────────┘
+        │  ① Space-Track fetch          │  │  SystemMessage (expert  │
+        │  ② LEO altitude filter        │  │    ops assistant;       │
+        │  ③ Stratified altitude sample │  │    accuracy constraints)│
+        │  ④ Spatiotemporal prefilter   │  │  HumanMessage (metrics) │
+        │  ⑤ SGP4 propagation (TCA)     │  │  → structured Markdown  │
+        │  ⑥ TEME→geodetic (GMST)       │  │    advisory; NOT Pc     │
+        │  ⑦ Screening Pc (σ=200 m)     │  │    calculation          │
+        │                               │  └─────────────────────────┘
         └──────┬─────────────────┘
                │
         ┌──────▼──────────────────────────────────────────────┐
-        │            services/db.py  (SQLite)                  │
+        │            services/db.py  (SQLite v2)               │
         │  scans(id, scanned_at, event_count)                  │
-        │  conjunction_events(scan_id, norad_id, pc_value, …)  │
+        │  conjunction_events(scan_id, norad_id, pc_value,     │
+        │    primary_lat, primary_lon, primary_alt_km,         │
+        │    secondary_lat, secondary_lon, secondary_alt_km,   │
+        │    position_source)                                  │
         └──────────────────────────────────────────────────────┘
                │
         ┌──────▼──────────────────────────────────────────────┐
@@ -142,20 +149,41 @@ The **Simplified General Perturbations 4 (SGP4)** model propagates orbital eleme
 
 OrbitSafe AI uses the **`sgp4`** Python library (the canonical Vallado C++ implementation) to compute ECI position/velocity vectors at each time step. The TCA is found by walking a 24-hour propagation window in 60-second steps, then bisecting the minimum-range interval over 20 iterations for sub-second accuracy.
 
-**LEO band filter:** After propagating the full catalog, OrbitSafe AI retains only objects in the **300–1,200 km altitude band** — the shell of highest conjunction density — before applying the spatial pre-filter. Objects are sorted by altitude so the KD-Tree receives spatially coherent input.
+**LEO band filter + stratified sample:** After propagating the full catalog, OrbitSafe AI retains only objects in the **300–1,200 km altitude band**. Rather than truncating the altitude-sorted list (which biases toward the lower band), it uses **deterministic stratified sampling** across 50-km altitude bins to ensure uniform coverage of the full LEO shell.
 
-### Probability of Collision ($P_c$) — Alfano 2-D Method
+### Spatiotemporal Candidate Discovery
 
-The $P_c$ calculation projects the combined positional covariance of both objects onto the **2-D encounter plane** perpendicular to the relative velocity vector at TCA. Within this plane, the probability distribution of the miss vector is a bivariate Gaussian:
+The previous snapshot-only KD-Tree query (built at t₀) missed pairs that are far apart at the start of the scan window but converge later. The current prefilter:
 
-$$P_c = \frac{1}{2\pi\sqrt{|C|}} \iint_{A} \exp\!\left(-\frac{1}{2}\,\vec{r}^{\,T} C^{-1} \vec{r}\right) dx\, dy$$
+1. Propagates all selected satellites at **5-minute coarse intervals** over the 24-hour window (288 epochs).
+2. Builds a KD-Tree at each epoch and collects pairs within 100 km.
+3. Returns the **union of all pairs** found at any epoch for fine TCA refinement.
+
+This captures future-converging pairs at essentially zero additional miss rate; LEO relative velocities (0–15 km/s) comfortably exceed the 333 m/s minimum detectable approach speed.
+
+### Epoch-Aware TEME → Geodetic Conversion
+
+SGP4 outputs positions in the TEME/ECI frame. The longitude of a satellite in inertial coordinates is NOT the same as its geographic longitude — Earth rotates by ~0.25°/min. OrbitSafe AI applies the **Greenwich Mean Sidereal Time (GMST)** rotation at TCA to convert ECI to Earth-fixed coordinates before computing latitude/longitude. The simplified IAU 1982 formula provides ~0.1° accuracy, sufficient for LEO globe placement.
+
+### Screening Probability of Collision ($P_c$)
+
+> **Important:** This is a **screening estimate**, not an authoritative CDM-quality Pc.
+
+The screening $P_c$ integrates a bivariate Gaussian over the combined hard-body cross-section in the encounter plane:
+
+$$P_c \approx \frac{1}{2\pi\sigma^2} \iint_{A} \exp\!\left(-\frac{|\vec{r}-\vec{r}_0|^2}{2\sigma^2}\right) dx\, dy$$
 
 Where:
-- $C$ = 2×2 combined covariance matrix in the encounter plane (isotropic $\sigma = 200\ \text{m}$ per object)
-- $A$ = combined hard-body cross-section (disk of radius $r_{HBR} = 5\ \text{m}$ for LEO spacecraft)
-- $\vec{r}$ = displacement vector from the nominal miss point to the integration variable
+- $\sigma = 200\ \text{m}$ — **assumed isotropic positional uncertainty** (no object-specific covariance matrix)
+- $A$ = combined hard-body cross-section (disk of radius $r_{HBR} = 5\ \text{m}$)
+- $\vec{r}_0 = (d, 0)$ — miss vector in the encounter plane
 
-The integral is evaluated numerically using `scipy.integrate.dblquad` over the hard-body disk.
+**Limitations of this estimate:**
+- No object-specific covariance matrix (CDM format would provide this)
+- Does not fully project covariance geometry into the encounter plane
+- Relative velocity is not used to construct covariance geometry
+
+The integral is evaluated numerically via `scipy.integrate.dblquad`. Authoritative maneuver decisions require CDM-quality covariance data and review by a qualified flight-dynamics team.
 
 **Risk thresholds:**
 
@@ -166,9 +194,9 @@ The integral is evaluated numerically using `scipy.integrate.dblquad` over the h
 | 🟡 **ELEVATED** | $1 \times 10^{-6} \leq P_c < 1 \times 10^{-5}$ | Increased watch cadence |
 | 🟢 **MONITOR** | $P_c < 1 \times 10^{-6}$ | Routine tracking |
 
-### $O(n^2)$ Mitigation — KD-Tree Spatial Index
+### $O(n^2)$ Mitigation — Spatiotemporal KD-Tree
 
-With thousands of active LEO objects, a naïve pairwise check would require millions of SGP4 calls per scan. OrbitSafe AI builds a **`scipy.spatial.KDTree`** on 3-D ECI position vectors and queries for all pairs within 100 km. This reduces candidate pairs by roughly 99.9%, making real-time scans operationally feasible.
+With thousands of active LEO objects, a naïve pairwise check would require millions of SGP4 calls per scan. The spatiotemporal prefilter builds `scipy.spatial.KDTree` instances at coarse epochs, eliminating pairs that never pass within 100 km across the 24-hour window. Only surviving candidate pairs proceed to full 60-second TCA bisection.
 
 ---
 
@@ -217,8 +245,8 @@ GET /basicspacedata/query/class/gp
 
 **Message construction:**
 
-1. A **`SystemMessage`** establishes the LLM as an expert Space Operations AI specialising in conjunction triage and orbital mechanics, with instructions to structure the response in four numbered sections.
-2. A **`HumanMessage`** passes the full conjunction payload — satellite name, NORAD ID, miss distance, relative velocity, $P_c$ value, and pre-computed risk tier — with an instruction to assume a standard LEO spacecraft with a ~1 N hydrazine thruster.
+1. A **`SystemMessage`** establishes the LLM as an expert Space Operations AI with strict accuracy constraints: it must acknowledge the Pc is a screening estimate, must not describe the event as a guaranteed collision, must use advisory language for maneuver candidates, and must always include the mandatory disclaimer. The LLM explains and contextualises the orbital mechanics metrics — **it does NOT calculate or invent collision probability**.
+2. A **`HumanMessage`** passes the full conjunction payload — satellite name, NORAD ID, miss distance, relative velocity, screening Pc with its assumed σ, and pre-computed risk tier.
 
 ### Structured Output Schema
 
@@ -249,9 +277,9 @@ Covers orbital geometry and measurement uncertainties:
 
 ---
 
-**Section 3 — Recommended Evasive Maneuver**
+**Section 3 — Candidate Maneuver Options**
 
-Specifies the burn vector and sizing for a standard LEO hydrazine thruster (~1 N):
+Specifies candidate burn vectors for flight-dynamics review, assuming a standard LEO hydrazine thruster (~1 N):
 
 - **Burn direction**: Prograde or retrograde along-track (altitude change shifts the orbital period, moving the satellite out of the conjunction geometry)
 - **$\Delta V$ estimate**: Typically $0.05\ \text{m/s}$ to $0.1\ \text{m/s}$ for LEO conjunctions — expressed as $\Delta V \approx 0.05\text{--}0.1\ \text{m/s}$
@@ -260,7 +288,7 @@ Specifies the burn vector and sizing for a standard LEO hydrazine thruster (~1 N
 
 ---
 
-**Section 4 — Urgency Timeline**
+**Section 4 — Recommended Next Steps**
 
 Operational milestones keyed to TCA:
 
@@ -288,11 +316,13 @@ The frontend renders these using KaTeX (via `rehype-katex`) with dark-theme colo
 
 **Mandatory Advisory Disclaimer**
 
-Every AI triage response displayed in the drawer is followed by the fixed footer:
+Every AI triage response includes a mandatory disclaimer:
 
-> *AI recommendations are advisory only. All maneuvers require flight-dynamics team authorisation.*
+> *⚠ AI recommendations are advisory only. Authoritative maneuver decisions require object-specific covariance/CDM data and review by a qualified flight-dynamics team.*
 
-This disclaimer is hardcoded in `TriageDrawer.tsx` and is not part of the LLM output.
+This advisory appears both as a hardcoded footer in `TriageDrawer.tsx` and as a constraint in the LLM system prompt.
+
+**AI role boundary:** The AI assistant explains the orbital mechanics, contextualises the risk metrics, and suggests candidate maneuvers for specialist review. The deterministic orbital calculations (SGP4, TCA, Pc) are computed by the Python astrodynamics engine — the LLM does not compute or invent collision probability.
 
 ---
 
@@ -312,7 +342,7 @@ The `TriageDrawer` component renders the full structured response with:
 
 Every completed orbital scan is automatically persisted to a local **SQLite database** (`backend/data/orbitsafe.db`), initialised at server startup via the FastAPI lifespan handler.
 
-### Schema
+### Schema (v2)
 
 ```sql
 CREATE TABLE scans (
@@ -331,11 +361,19 @@ CREATE TABLE conjunction_events (
     tca_iso               TEXT    NOT NULL,
     miss_distance_km      REAL    NOT NULL,
     relative_velocity_kms REAL    NOT NULL,
-    pc_value              REAL    NOT NULL
+    pc_value              REAL    NOT NULL,
+    -- v2 position fields (added via idempotent migration)
+    primary_lat           REAL,    -- geodetic lat at TCA (GMST-corrected)
+    primary_lon           REAL,    -- geodetic lon at TCA (GMST-corrected)
+    primary_alt_km        REAL,    -- altitude above mean sphere at TCA
+    secondary_lat         REAL,
+    secondary_lon         REAL,
+    secondary_alt_km      REAL,
+    position_source       TEXT     -- "tca" | "legacy-fallback"
 );
 ```
 
-Indexed on `scan_id` and `pc_value DESC` for fast history retrieval sorted by risk.
+Indexed on `scan_id` and `pc_value DESC`. `init_db()` applies schema v2 columns idempotently on every startup via `ALTER TABLE … ADD COLUMN` (with `OperationalError` catch for pre-existing columns). Existing databases migrate without data loss; legacy rows receive `position_source = 'legacy-fallback'`.
 
 ### Scan History UI
 
@@ -343,7 +381,8 @@ The **History** button in the dashboard header opens the `ScanHistoryDrawer`:
 
 - **List view** — all past scans (newest first) showing scan ID, UTC timestamp, and event count
 - **Detail view** — click any scan to see its full conjunction event list, sorted by descending $P_c$
-- **Load into Dashboard** — replaces the live event table and globe with a historical scan for comparison
+- **Load into Dashboard** — replaces the live event table and globe with a historical scan; TCA positions are loaded from the stored coordinates
+- **Legacy disclosure** — events with `position_source = "legacy-fallback"` (pre-v2 scans) display a visible warning rather than silently showing incorrect globe positions
 
 ---
 
@@ -381,7 +420,8 @@ space-exploration-challenge/
 │   └── services/
 │       ├── __init__.py
 │       ├── space_track.py          # Space-Track.org auth + GP fetch client
-│       ├── orbital_math.py         # SGP4 engine, KD-Tree, TCA bisection, Pc
+│       ├── orbital_math.py         # SGP4 engine, stratified sample, spatiotemporal
+│       │                           # prefilter, TCA bisection, GMST conversion, Pc
 │       └── db.py                   # SQLite persistence (init, save, query)
 │
 └── frontend/
@@ -467,7 +507,7 @@ curl "http://localhost:8000/api/scan_conjunctions?max_objects=400"
 
 ### 4. AI Triage
 
-Click any row in the conjunction table (or the **Triage** button) to open the AI drawer. The backend calls the LLM and streams back a structured Markdown + LaTeX evasive maneuver recommendation.
+Click any row in the conjunction table (or the **Triage** button) to open the AI drawer. The backend calls the LLM and returns a structured Markdown + LaTeX advisory. The LLM explains and contextualises the orbital mechanics metrics — it does not calculate or invent collision probability. All maneuver recommendations are advisory only and require flight-dynamics review.
 
 ### 5. View Scan History
 
@@ -479,7 +519,7 @@ Click **"History"** in the dashboard header to browse all past scans. Select any
 
 ### `GET /api/scan_conjunctions`
 
-Triggers a full orbital scan. Fetches GP data from Space-Track.org, propagates the LEO band via SGP4, applies KD-Tree pre-filtering, computes $P_c$ for each candidate pair, and persists results to SQLite.
+Triggers a full orbital scan. Fetches GP data from Space-Track.org, propagates the LEO band via SGP4, applies stratified altitude sampling, runs the spatiotemporal prefilter over 24 h at 5-min intervals, computes TCA and Screening Pc for each candidate pair, and persists results to SQLite.
 
 **Query Parameters:**
 - `max_objects` *(int, default 400)* — LEO objects to process after altitude filtering
@@ -498,7 +538,16 @@ Triggers a full orbital scan. Fetches GP data from Space-Track.org, propagates t
       "tca_iso": "2026-08-15T14:23:07Z",
       "miss_distance_km": 0.842,
       "relative_velocity_kms": 13.7,
-      "pc_value": 2.34e-4
+      "pc_value": 2.34e-4,
+      "primary_lat": 51.45,
+      "primary_lon": -20.38,
+      "primary_alt_km": 408.2,
+      "secondary_lat": 51.45,
+      "secondary_lon": -20.38,
+      "secondary_alt_km": 408.6,
+      "pc_assumed_sigma_m": 200.0,
+      "pc_hard_body_radius_m": 5.0,
+      "pc_method": "screening-isotropic-gaussian"
     }
   ]
 }
@@ -526,9 +575,12 @@ AI-powered evasive maneuver recommendation.
 {
   "norad_id": 25544,
   "sat_name": "ISS (ZARYA)",
-  "risk_tier": "CRITICAL (immediate action required)",
+  "risk_tier": "CRITICAL (Pc ≥ 1×10⁻⁴)",
   "pc_value": 2.34e-4,
-  "summary": "**1. Risk Assessment**\n\n* **Status:** CRITICAL...\n\n**3. Recommended Evasive Maneuver**\n\n* $\\Delta V \\approx 0.05\\ \\text{m/s}$ prograde burn..."
+  "pc_method": "screening-isotropic-gaussian",
+  "pc_assumed_sigma_m": 200.0,
+  "advisory": "AI recommendations are advisory only. All maneuver decisions require object-specific covariance/CDM data and review by a qualified flight-dynamics team.",
+  "summary": "**1. Risk Assessment**\n\n* **Status:** CRITICAL (screening Pc)...\n\n**3. Candidate Maneuver Options**\n\n* $\\Delta V \\approx 0.05\\ \\text{m/s}$ prograde burn (for FD review)..."
 }
 ```
 
@@ -599,11 +651,11 @@ Liveness probe. Returns `{"status": "ok"}`.
 | Variable | Required | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | ✅ | API key for LLM triage endpoint |
-| `OPENAI_BASE_URL` | ✅ | Base URL for OpenAI-compatible endpoint |
+| `OPENAI_BASE_URL` | ✅ | Base URL for OpenAI-compatible endpoint (OpenAI, IBM watsonx, Gemini, etc.) |
 | `LLM_MODEL` | ✅ | Model identifier (e.g. `gpt-4o-mini`, `ibm/granite-3-8b-instruct`) |
 | `SPACE_TRACK_USERNAME` | ✅ | Space-Track.org registered email |
 | `SPACE_TRACK_PASSWORD` | ✅ | Space-Track.org password |
-| `GP_SOURCE` | ➖ | `auto` (default) \| `space-track` \| `local` |
+| `GP_SOURCE` | ➖ | `auto` (default) \| `space-track` \| `local` — CelesTrak is no longer supported |
 
 ---
 
@@ -664,13 +716,15 @@ For LEO ($a \approx 6771\ \text{km}$, $\mu = 398600\ \text{km}^3/\text{s}^2$), a
 
 ---
 
-## ⚠️ Limitations & Future Work
+## ⚠️ Limitations & Scientific Caveats
 
-- **Covariance data** — Full conjunction analysis requires object-specific covariance matrices (CDM/CSM format). OrbitSafe AI uses a uniform isotropic $\sigma = 200\ \text{m}$ as a conservative approximation.
-- **Catalog size** — Demo is capped at 400 LEO objects for runtime feasibility. Production deployment would use `asyncio` + `ProcessPoolExecutor` for the full ~27,000 object catalog.
-- **Maneuver planning** — Actual burn execution requires integration with flight dynamics software (GMAT, Orekit). The LLM output is advisory only.
-- **Fragmentation modelling** — Does not currently model breakup events or cascading debris (Kessler syndrome modelling).
-- **Real-time covariance updates** — Space-Track CDM (Conjunction Data Message) files provide object-specific covariance; ingesting these would significantly improve $P_c$ accuracy.
+- **Screening Pc only** — OrbitSafe AI computes a Screening Pc using an assumed isotropic $\sigma = 200\ \text{m}$. This is NOT a CDM-quality operational probability. Authoritative maneuver decisions require object-specific covariance matrices (CDM/CSM format), full encounter plane projection, and review by a qualified flight-dynamics team.
+- **Globe auto-spin is cosmetic** — The globe rotation in the dashboard is a display effect only. It does NOT represent the passage of orbital time or the motion of satellites toward TCA.
+- **Encounter inset is not to scale** — The magnified encounter inset shows primary and secondary at a readable fixed separation for labelling purposes. The actual 0.40 km miss distance is sub-pixel at Earth scale and is correctly displayed as the numerical value only.
+- **GMST approximation** — Longitude conversion uses the simplified IAU 1982 GMST formula (~0.1° accuracy). A full IAU 2000/2006 implementation would improve geographic precision.
+- **Catalog coverage** — Stratified sampling of up to 500 LEO objects is used for demo runtime. Production deployment would require `asyncio` + `ProcessPoolExecutor` for the full ~27,000+ object catalog.
+- **Maneuver recommendations are advisory** — The LLM suggests candidate maneuver vectors; it does not calculate or invent collision probability. Actual burn execution requires integration with flight dynamics software (GMAT, Orekit) and authorised execution by flight-dynamics personnel.
+- **Fragmentation modelling** — Does not model breakup events or cascading debris (Kessler syndrome).
 
 ---
 

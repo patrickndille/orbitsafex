@@ -8,20 +8,52 @@ export interface ConjunctionEvent {
   tca_iso: string;              // ISO-8601 UTC
   miss_distance_km: number;
   relative_velocity_kms: number;
-  pc_value: number;             // Probability of Collision 0–1; 0 = MONITOR sentinel
+  /**
+   * Screening Probability of Collision (0–1).
+   * 0 is a sentinel meaning the value was below the reporting threshold (1e-6).
+   * This is an estimate using assumed isotropic covariance (σ=200 m) and is
+   * NOT equivalent to a CDM-quality operational Pc value.
+   */
+  pc_value: number;
 
-  // Geographic positions at TCA (from ECI vectors) — used by GlobeView
+  // Geographic positions at TCA (from TEME/ECI vectors) — used by GlobeView
   primary_lat?: number;
   primary_lon?: number;
   primary_alt_km?: number;
   secondary_lat?: number;
   secondary_lon?: number;
   secondary_alt_km?: number;
+
+  /**
+   * "tca"             – coordinates derived from SGP4 at TCA
+   * "legacy-fallback" – row predates position columns; coordinates unavailable
+   */
+  position_source?: "tca" | "legacy-fallback";
+}
+
+/** Coverage and prefilter metadata returned with every scan. */
+export interface ScanMetadata {
+  eligible_leo_objects?: number;
+  sampled_objects?: number;
+  alt_bins?: number;
+  bin_width_km?: number;
+  out_of_range_skipped?: number;
+  propagation_window_h?: number;
+  coarse_interval_s?: number;
+  screening_radius_km?: number;
+  satellites_evaluated?: number;
+  coarse_epochs_evaluated?: number;
+  candidate_pairs?: number;
+  /** Explicit statement of the prefilter's fast-pass screening gap. */
+  prefilter_limitation?: string;
 }
 
 export interface ScanResponse {
+  scan_id?: number;
   count: number;
   events: ConjunctionEvent[];
+  /** Top-level scan coverage metadata (not duplicated per event). */
+  scan_metadata?: ScanMetadata;
 }
 
 export interface TriageRequest {

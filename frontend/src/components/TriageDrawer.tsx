@@ -191,14 +191,14 @@ export default function TriageDrawer({ event, onClose }: Props) {
             {/* ── Metrics grid ────────────────────────────────────── */}
             <div className="grid grid-cols-2 gap-3 px-6 py-4 border-b border-slate-700/50">
               <MetricCard
-                label="Probability of Collision"
+                label="Screening Pc (est.)"
                 value={formatPc(event.pc_value)}
-                sub="Pc"
+                sub="σ=200 m assumed — not CDM-quality"
                 highlight={tier !== "MONITOR"}
                 highlightClass={TIER_COLOUR[tier].split(" ")[0]}
               />
               <MetricCard
-                label="Miss Distance"
+                label="Predicted Miss Distance"
                 value={`${event.miss_distance_km.toFixed(2)} km`}
                 sub="at TCA"
               />
@@ -213,11 +213,20 @@ export default function TriageDrawer({ event, onClose }: Props) {
                 sub={`#${event.secondary_norad_id}`}
               />
               <MetricCard
-                label="Time of Closest Approach"
+                label="Time of Closest Approach (TCA)"
                 value={new Date(event.tca_iso).toUTCString().substring(0, 25)}
                 sub="UTC"
                 fullWidth
               />
+            </div>
+
+            {/* ── Pc disclaimer ───────────────────────────────────── */}
+            <div className="mx-6 my-3 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-300">
+              <strong>Screening estimate only.</strong> This Pc uses an assumed
+              isotropic σ=200 m and a simplified Gaussian integral.
+              It is <em>not</em> equivalent to a CDM-quality operational probability.
+              Authoritative maneuver decisions require object-specific covariance
+              data and review by a qualified flight-dynamics team.
             </div>
 
             {/* ── AI recommendation ───────────────────────────────── */}
@@ -275,8 +284,9 @@ export default function TriageDrawer({ event, onClose }: Props) {
                     </div>
                   </div>
                   <p className="text-xs text-slate-600 italic">
-                    AI recommendations are advisory only. All maneuvers require
-                    flight-dynamics team authorisation.
+                    ⚠ AI recommendations are advisory only. Authoritative
+                    maneuver decisions require object-specific covariance/CDM
+                    data and review by a qualified flight-dynamics team.
                   </p>
                 </div>
               )}

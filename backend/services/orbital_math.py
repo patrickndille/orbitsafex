@@ -6,10 +6,21 @@ Core astrodynamics engine for OrbitSafe AI.
 Pipeline
   1. Fetch live GP data from Space-Track.org (3-hour in-memory cache,
      local JSON fallback on every successful fetch)
-  2. Build a KD-Tree altitude index to pre-filter candidate pairs  (O(n log n))
-  3. For each candidate pair run SGP4 forward-propagation to find TCA
-  4. Project the combined covariance onto the 2-D encounter plane
-  5. Integrate the 2-D Gaussian over the combined hard-body area → Pc
+  2. Stratified-sample across LEO altitude bins (Priority 5 — removes bias)
+  3. Spatiotemporal coarse prefilter: propagate at coarse intervals over the
+     24-hour window, build a KD-Tree at each epoch, collect the union of pairs
+     that pass within the screening radius at ANY epoch (Priority 4 — finds
+     future-converging pairs that are far apart at t0)
+  4. For each candidate pair run SGP4 bisection to find TCA
+  5. Convert TEME ECI positions to geodetic using GMST at TCA (Priority 3 —
+     epoch-aware Earth rotation)
+  6. Compute Screening Pc using an isotropic 2-D Gaussian (assumed σ=200 m);
+     this is NOT a full covariance-based operational Pc (Priority 6)
+
+Scientific caveats
+  • Pc uses a fixed isotropic σ=200 m; no object-specific covariance matrix.
+  • GMST conversion uses a first-order approximation; accuracy ≈ 0.1° in lon.
+  • Both are sufficient for screening/triage, not authoritative CDM analysis.
 """
 
 from __future__ import annotations
@@ -37,13 +48,39 @@ XP3O15 = 1440.0 / (2.0 * math.pi)   # converts rev/day → rad/min
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-EARTH_RADIUS_KM = 6371.0        # mean Earth radius
-ALT_BIN_WIDTH_KM = 50.0         # altitude bin for spatial pre-filter
-PROPAGATION_STEP_S = 60.0       # seconds between propagation steps
-PROPAGATION_WINDOW_H = 24.0     # hours to look ahead
-HARD_BODY_RADIUS_M = 5.0        # combined hard-body radius (metres)
-DEFAULT_SIGMA_M = 200.0         # 1-σ position uncertainty (metres), isotropic
-PC_THRESHOLD = 1e-6             # report only conjunctions above this Pc
+EARTH_RADIUS_KM   = 6371.0        # mean Earth radius
+ALT_BIN_WIDTH_KM  = 50.0          # altitude bin width for stratified sampling
+PROPAGATION_STEP_S = 60.0         # seconds between fine TCA-search steps
+PROPAGATION_WINDOW_H = 24.0       # hours to look ahead
+
+# Spatiotemporal coarse prefilter
+# ─────────────────────────────────────────────────────────────────────────────
+# The coarse prefilter samples every COARSE_INTERVAL_S seconds and flags pairs
+# that come within COARSE_SCREEN_KM at any sampled epoch.
+#
+# KNOWN LIMITATION — screening gap:
+#   In the worst case an object travelling at v_rel km/s can travel
+#   v_rel * COARSE_INTERVAL_S km between samples.  At 15 km/s that is
+#   15 × 60 = 900 km per 60-second step, or 15 × 300 = 4,500 km per 5-minute
+#   step.  A fast conjunction pair can therefore pass completely through the
+#   COARSE_SCREEN_KM = 100 km screening sphere between samples and be missed.
+#
+#   This is a genuine gap, not a corner case.  The prefilter is reliable only
+#   for pairs whose closest approach lasts longer than one coarse step, i.e.
+#   pairs with low relative velocity or a long dwell time inside the sphere.
+#   For operational use the fine-step TCA walk (PROPAGATION_STEP_S = 60 s)
+#   also has the same limitation, though at smaller scale.
+#
+#   The prefilter is provided as an O(n log n) first-pass screen that
+#   dramatically reduces the number of pairs sent to the expensive fine TCA
+#   search.  It should be accompanied by an explicit disclaimer that it is
+#   NOT a complete conjunction detector and that fast-pass pairs may escape it.
+COARSE_INTERVAL_S  = 60.0         # 1-minute coarse step (matches fine TCA step)
+COARSE_SCREEN_KM   = 200.0        # KD-Tree screening radius — 2× fine miss threshold
+
+HARD_BODY_RADIUS_M = 5.0          # combined hard-body radius (metres)
+DEFAULT_SIGMA_M    = 200.0        # assumed isotropic 1-σ position uncertainty (m)
+PC_THRESHOLD       = 1e-6         # report only conjunctions above this screening Pc
 
 logger = logging.getLogger("orbital_math")
 
@@ -62,28 +99,20 @@ _gp_cache_info: dict = {"age_seconds": None, "record_count": 0, "last_fetch_sour
 # ──────────────────────────────────────────────────────────────────────────────
 # GP data cache — stale-while-revalidate pattern
 # ──────────────────────────────────────────────────────────────────────────────
-#   _gp_cache_data  – last successful payload (survives transient errors)
-#   _gp_cache_ts    – Unix timestamp of that fetch
-#   _GP_CACHE_TTL   – how long before we attempt a refresh (3 h)
-# ──────────────────────────────────────────────────────────────────────────────
-_GP_CACHE_TTL     = 10800          # 3 hours — Space-Track GP update cadence
-_FETCH_MAX_RETRIES = 3             # retries for transient errors
-_FETCH_BACKOFF_BASE = 2.0          # seconds; doubled each retry
+_GP_CACHE_TTL      = 10800          # 3 hours — Space-Track GP update cadence
+_FETCH_MAX_RETRIES = 3
+_FETCH_BACKOFF_BASE = 2.0
 
 _gp_cache_data: Optional[list] = None
 _gp_cache_ts:   float          = 0.0
 
 
 def _resolve_source_order(source: str) -> list[str]:
-    """Return ordered list of data sources to try based on GP_SOURCE env var.
-
-    Supported values: "auto" | "space-track" | "local"
-    """
+    """Return ordered list of data sources to try based on GP_SOURCE env var."""
     if source == "space-track":
         return ["space-track", "local"]
     if source == "local":
         return ["local"]
-    # "auto" default: Space-Track → local fallback
     return ["space-track", "local"]
 
 
@@ -196,7 +225,7 @@ class SatelliteRecord:
     norad_id: int
     name: str
     satrec: Satrec
-    altitude_km: float = 0.0          # approximate current altitude
+    altitude_km: float = 0.0
     pos_km: np.ndarray = field(default_factory=lambda: np.zeros(3))
     vel_kms: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
@@ -207,7 +236,7 @@ class ConjunctionEvent:
     primary_name: str
     secondary_norad: int
     secondary_name: str
-    tca_unix: float                    # Unix timestamp of TCA
+    tca_unix: float
     miss_distance_km: float
     relative_velocity_kms: float
     pc_value: float
@@ -216,7 +245,6 @@ class ConjunctionEvent:
 # ──────────────────────────────────────────────────────────────────────────────
 # SGP4 helpers
 # ──────────────────────────────────────────────────────────────────────────────
-# SGP4 error code descriptions for debug logging
 _SGP4_ERRORS = {
     1: "mean eccentricity < 0 or >= 1",
     2: "mean motion < 0",
@@ -226,26 +254,7 @@ _SGP4_ERRORS = {
     6: "satellite has decayed",
 }
 
-
-# ── OMM JSON → sgp4init field map ───────────────────────────────────────────
-# Space-Track OMM JSON uses CCSDS OMM field names.  Map each OMM key to the
-# legacy GP key so _build_satrec works with both response formats.
-#
-# OMM field          Legacy GP field    Notes
-# ─────────────────────────────────────────────────────────────────
-# NORAD_CAT_ID       NORAD_CAT_ID       same in both
-# OBJECT_NAME        OBJECT_NAME        same in both
-# EPOCH              EPOCH              same in both
-# MEAN_MOTION_DOT    NDOT               rev/day²
-# MEAN_MOTION_DDOT   NDDOT              rev/day³
-# BSTAR              BSTAR              same in both
-# INCLINATION        INCLO              degrees
-# RA_OF_ASC_NODE     RAAN               degrees
-# ECCENTRICITY       ECCO               dimensionless
-# ARG_OF_PERICENTER  ARGPO              degrees
-# MEAN_ANOMALY       MO                 degrees
-# MEAN_MOTION        NO_KOZAI           rev/day
-# ─────────────────────────────────────────────────────────────────
+# ── OMM JSON → sgp4init field map ────────────────────────────────────────────
 _OMM_TO_GP: dict[str, str] = {
     "MEAN_MOTION_DOT":  "NDOT",
     "MEAN_MOTION_DDOT": "NDDOT",
@@ -259,11 +268,7 @@ _OMM_TO_GP: dict[str, str] = {
 
 
 def _normalise_gp(gp: dict) -> dict:
-    """
-    Return a copy of *gp* with OMM field names aliased to legacy GP names.
-    Records that already use legacy names pass through unchanged, so the
-    function is safe to call on both FORMAT=json and FORMAT=JSON responses.
-    """
+    """Alias OMM field names to legacy GP names; safe to call on both formats."""
     out = dict(gp)
     for omm_key, gp_key in _OMM_TO_GP.items():
         if omm_key in out and gp_key not in out:
@@ -276,7 +281,6 @@ def _build_satrec(gp: dict) -> Optional[Satrec]:
     try:
         gp = _normalise_gp(gp)
 
-        # Parse ISO epoch string into Julian Date components
         epoch_str = gp["EPOCH"].replace("Z", "")
         ep_dt = datetime.datetime.fromisoformat(epoch_str)
         jd, fr = jday(
@@ -286,19 +290,19 @@ def _build_satrec(gp: dict) -> Optional[Satrec]:
 
         sat = Satrec()
         sat.sgp4init(
-            WGS72,                                # WGS72 gravity model object
-            "i",                                  # improved SGP4 mode
+            WGS72,
+            "i",
             int(gp["NORAD_CAT_ID"]),
-            jd + fr - 2433281.5,                  # epoch: days since 1949-12-31 00:00 UT
+            jd + fr - 2433281.5,
             float(gp["BSTAR"]),
             float(gp["NDOT"]),
             float(gp["NDDOT"]),
             float(gp["ECCO"]),
-            float(gp["ARGPO"]) * DEG2RAD,         # rad
-            float(gp["INCLO"]) * DEG2RAD,         # rad
-            float(gp["MO"]) * DEG2RAD,            # rad
-            float(gp["NO_KOZAI"]) / XP3O15,       # rad/min
-            float(gp["RAAN"]) * DEG2RAD,          # rad
+            float(gp["ARGPO"]) * DEG2RAD,
+            float(gp["INCLO"]) * DEG2RAD,
+            float(gp["MO"])    * DEG2RAD,
+            float(gp["NO_KOZAI"]) / XP3O15,
+            float(gp["RAAN"])  * DEG2RAD,
         )
         return sat
 
@@ -323,12 +327,80 @@ def _propagate(satrec: Satrec, unix_ts: float) -> Tuple[Optional[np.ndarray], Op
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Spatial pre-filter – altitude-binned KD-Tree
+# Priority 3 — TEME/ECI → Earth-fixed (epoch-aware GMST conversion)
 # ──────────────────────────────────────────────────────────────────────────────
-def _current_state(satrec: Satrec, unix_ts: float) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    return _propagate(satrec, unix_ts)
+def _gmst_rad(unix_ts: float) -> float:
+    """
+    Greenwich Mean Sidereal Time (radians) at unix_ts.
+
+    Uses the simplified IAU 1982 formula.  Accuracy is approximately 0.1–0.3°
+    for dates within a few years of J2000, adequate for globe visualisation
+    but not precision geodesy.
+
+    Formula reference:
+        GMST at J2000.0 = 280.46061837°
+        Rate             = 360.98564736629 °/day (sidereal rotation)
+
+    Epoch note:
+        J2000.0 is 2000-01-01 12:00:00 TT.  The Unix timestamp used here
+        is the UTC equivalent, 946728000.0 s (2000-01-01 12:00:00 UTC).
+        The ~64-second TT–UTC difference at J2000 produces a ~0.27° offset
+        in the GMST value; this is within the stated visualisation accuracy.
+    """
+    # J2000.0 = 2000-01-01 12:00:00 UTC  (TT≈UTC+64s; error ≈0.27° — acceptable)
+    J2000_UNIX = 946728000.0
+    days_since_j2000 = (unix_ts - J2000_UNIX) / 86400.0
+    gmst_deg = (280.46061837 + 360.98564736629 * days_since_j2000) % 360.0
+    return math.radians(gmst_deg)
 
 
+def teme_to_geodetic(pos_km: np.ndarray, tca_unix: float) -> Tuple[float, float, float]:
+    """
+    Convert a TEME (SGP4 output) position vector to geodetic (lat, lon, alt).
+
+    Steps:
+      1. Rotate the inertial (TEME) X-Y axes by -GMST to get Earth-fixed X-Y.
+      2. Compute spherical geodetic coordinates on a mean sphere (WGS84 would
+         add ≤ 20 km error in altitude, acceptable for this application).
+
+    Approximation: spherical Earth model; oblateness is neglected.
+    Accuracy: longitude to ~0.1°; adequate for LEO globe placement.
+
+    Args:
+        pos_km:   ECI/TEME position vector [x, y, z] in km
+        tca_unix: Unix timestamp of the epoch (used to compute GMST)
+
+    Returns:
+        (latitude_deg, longitude_deg, altitude_km)
+        longitude is normalised to [-180, 180].
+    """
+    x, y, z = float(pos_km[0]), float(pos_km[1]), float(pos_km[2])
+    gmst = _gmst_rad(tca_unix)
+
+    # Rotate inertial X-Y by -GMST → Earth-fixed X-Y
+    cos_g = math.cos(gmst)
+    sin_g = math.sin(gmst)
+    xf =  cos_g * x + sin_g * y
+    yf = -sin_g * x + cos_g * y
+    zf =  z
+
+    r = math.sqrt(xf * xf + yf * yf + zf * zf)
+    lat = math.degrees(math.asin(zf / r))
+    lon = math.degrees(math.atan2(yf, xf))
+
+    # Normalise longitude to [-180, 180]
+    if lon > 180.0:
+        lon -= 360.0
+    elif lon < -180.0:
+        lon += 360.0
+
+    alt = r - EARTH_RADIUS_KM
+    return round(lat, 4), round(lon, 4), round(alt, 4)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Build satellite list
+# ──────────────────────────────────────────────────────────────────────────────
 def build_satellite_list(gp_records: list[dict], t0: float) -> list[SatelliteRecord]:
     """Build SatelliteRecord list with current ECI state at t0."""
     sats: list[SatelliteRecord] = []
@@ -342,7 +414,7 @@ def build_satellite_list(gp_records: list[dict], t0: float) -> list[SatelliteRec
             if sat is None:
                 skipped_build += 1
                 continue
-            pos, vel = _current_state(sat, t0)
+            pos, vel = _propagate(sat, t0)
             if pos is None:
                 skipped_prop += 1
                 continue
@@ -359,38 +431,186 @@ def build_satellite_list(gp_records: list[dict], t0: float) -> list[SatelliteRec
                 vel_kms=vel,
             ))
         except Exception as exc:
-            logger.debug("Skipping NORAD %s due to unexpected error: %s",
-                         gp.get("NORAD_CAT_ID"), exc)
+            logger.debug("Skipping NORAD %s: %s", gp.get("NORAD_CAT_ID"), exc)
             skipped_build += 1
 
     logger.info(
-        "Built %d valid satellite records (skipped: %d build errors, "
-        "%d propagation errors, %d sub-orbital).",
+        "Built %d valid satellite records (skipped: %d build, %d propagation, %d sub-orbital).",
         len(sats), skipped_build, skipped_prop, skipped_alt,
     )
     return sats
 
 
-def find_candidate_pairs(sats: list[SatelliteRecord], delta_alt_km: float = 100.0) -> list[Tuple[int, int]]:
+# ──────────────────────────────────────────────────────────────────────────────
+# Priority 5 — Stratified altitude sampling
+# ──────────────────────────────────────────────────────────────────────────────
+def stratified_sample(
+    sats: list[SatelliteRecord],
+    max_objects: int,
+    bin_width_km: float = ALT_BIN_WIDTH_KM,
+) -> Tuple[list[SatelliteRecord], dict]:
     """
-    Use a KD-Tree on 3-D ECI positions to find pairs within 100 km.
-    This reduces O(n²) brute-force to O(n log n) pre-filter.
+    Return up to max_objects satellites sampled proportionally across altitude
+    bins of bin_width_km, covering 300–1200 km.
+
+    Strategy: deterministic stratified sampling.
+      1. Assign each satellite to its altitude bin.
+      2. Compute each bin's proportional quota (floor + remainder).
+      3. Sort each bin by NORAD ID for reproducibility.
+      4. Take the first quota from each bin.
+
+    This ensures coverage across the full 300–1200 km band regardless of
+    the density distribution (many LEO objects cluster at specific altitudes).
+
+    Returns:
+        (sampled_list, coverage_metadata)
+    """
+    alt_min, alt_max = 300.0, 1200.0
+    n_bins = int((alt_max - alt_min) / bin_width_km)
+
+    bins: list[list[SatelliteRecord]] = [[] for _ in range(n_bins)]
+    out_of_range = 0
+
+    for s in sats:
+        bin_idx = int((s.altitude_km - alt_min) / bin_width_km)
+        if 0 <= bin_idx < n_bins:
+            bins[bin_idx].append(s)
+        else:
+            out_of_range += 1
+
+    total_eligible = sum(len(b) for b in bins)
+    if total_eligible == 0:
+        return [], {"eligible": 0, "sampled": 0, "bins": n_bins}
+
+    quota = min(max_objects, total_eligible)
+
+    # Proportional quotas per bin
+    base = [int(quota * len(b) / total_eligible) for b in bins]
+    remainder = quota - sum(base)
+
+    # Assign remainders to bins with most objects first
+    bin_order = sorted(range(n_bins), key=lambda i: len(bins[i]), reverse=True)
+    for i in range(remainder):
+        base[bin_order[i]] += 1
+
+    sampled: list[SatelliteRecord] = []
+    for i, (b, q) in enumerate(zip(bins, base)):
+        if q <= 0:
+            continue
+        # Sort by NORAD ID for determinism
+        b_sorted = sorted(b, key=lambda s: s.norad_id)
+        sampled.extend(b_sorted[:q])
+
+    coverage = {
+        "eligible_leo_objects":   total_eligible,
+        "sampled_objects":        len(sampled),
+        "alt_bins":               n_bins,
+        "bin_width_km":           bin_width_km,
+        "out_of_range_skipped":   out_of_range,
+    }
+
+    logger.info(
+        "Stratified sample: %d/%d LEO objects selected across %d altitude bins.",
+        len(sampled), total_eligible, n_bins,
+    )
+    return sampled, coverage
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Priority 4 — Spatiotemporal coarse prefilter
+# ──────────────────────────────────────────────────────────────────────────────
+def find_candidate_pairs_spatiotemporal(
+    sats: list[SatelliteRecord],
+    t0: float,
+    window_h: float = PROPAGATION_WINDOW_H,
+    coarse_s: float = COARSE_INTERVAL_S,
+    screen_km: float = COARSE_SCREEN_KM,
+) -> Tuple[list[Tuple[int, int]], dict]:
+    """
+    Spatiotemporal coarse prefilter: propagate all satellites at coarse intervals
+    over the full window; collect the union of pairs that pass within screen_km
+    at ANY sampled epoch.
+
+    This extends the current-epoch-only KD-Tree approach, which misses pairs
+    that are far apart at t0 but converge later in the window.
+
+    Algorithm:
+      1. At each coarse epoch t0 + k*coarse_s (k = 0, 1, …):
+         a. Propagate every satellite to that epoch (skip on SGP4 error).
+         b. Build a KD-Tree on 3-D ECI positions.
+         c. Query all pairs within screen_km.
+         d. Add new pairs to the union set.
+      2. Return the deduplicated union.
+
+    KNOWN LIMITATION — fast-pass screening gap:
+      A pair travelling at relative velocity v_rel can traverse the entire
+      screen_km sphere in screen_km / v_rel seconds.  If that transit time is
+      shorter than coarse_s the pair will not be captured at any sampled epoch.
+      With coarse_s = 60 s and screen_km = 200 km:
+        maximum safely-detected relative speed = 200 km / 60 s ≈ 3.3 km/s.
+      LEO relative speeds can reach 15 km/s, so fast-pass pairs CAN be missed.
+
+      Mitigation: use coarse_s = PROPAGATION_STEP_S (same step as fine search)
+      so the prefilter and the fine TCA walk have identical temporal resolution.
+      This increases cost but eliminates the screening gap relative to the fine
+      search.  The prefilter then serves as pure spatial partitioning (O(n log n)
+      vs O(n²)), not temporal coarsening.
+
+    Returns:
+        (pairs_as_index_list, scan_metadata_dict)
     """
     if not sats:
-        return []
-    positions = np.array([s.pos_km for s in sats])
-    tree = KDTree(positions)
-    pairs_set = set()
-    # Query all pairs within delta_alt_km km
-    indices_list = tree.query_ball_tree(tree, r=delta_alt_km)
-    for i, neighbours in enumerate(indices_list):
-        for j in neighbours:
-            if j <= i:
-                continue
-            pairs_set.add((i, j))
-    logger.info("KD-Tree pre-filter: %d candidate pairs from %d satellites.",
-                len(pairs_set), len(sats))
-    return list(pairs_set)
+        return [], {}
+
+    n_epochs = int(window_h * 3600.0 / coarse_s) + 1
+    pairs_set: set[Tuple[int, int]] = set()
+    n_sats = len(sats)
+    epochs_evaluated = 0
+
+    for k in range(n_epochs):
+        t = t0 + k * coarse_s
+        positions = []
+        valid_idx = []
+        for idx, sat in enumerate(sats):
+            pos, _ = _propagate(sat.satrec, t)
+            if pos is not None:
+                positions.append(pos)
+                valid_idx.append(idx)
+
+        if len(positions) < 2:
+            continue
+
+        pos_arr = np.array(positions)
+        tree = KDTree(pos_arr)
+        neighbour_lists = tree.query_ball_tree(tree, r=screen_km)
+
+        for local_i, neighbours in enumerate(neighbour_lists):
+            for local_j in neighbours:
+                if local_j <= local_i:
+                    continue
+                gi = valid_idx[local_i]
+                gj = valid_idx[local_j]
+                pair = (min(gi, gj), max(gi, gj))
+                pairs_set.add(pair)
+
+        epochs_evaluated += 1
+
+    metadata = {
+        "propagation_window_h":    window_h,
+        "coarse_interval_s":       coarse_s,
+        "screening_radius_km":     screen_km,
+        "satellites_evaluated":    n_sats,
+        "coarse_epochs_evaluated": epochs_evaluated,
+        "candidate_pairs":         len(pairs_set),
+    }
+
+    logger.info(
+        "Spatiotemporal prefilter: %d candidate pairs from %d satellites "
+        "over %d coarse epochs (window=%.0fh, step=%.0fs, r=%.0fkm).",
+        len(pairs_set), n_sats, epochs_evaluated,
+        window_h, coarse_s, screen_km,
+    )
+    return list(pairs_set), metadata
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -404,11 +624,10 @@ def find_tca(
     step_s: float = PROPAGATION_STEP_S,
 ) -> Tuple[float, float, float, Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    Walk the propagation window in `step_s` increments; return
-    (tca_unix, miss_distance_km, rel_velocity_kms, pos_a_km, pos_b_km)
-    at the minimum range epoch.  pos_a/b are ECI vectors (km) at TCA,
-    or None if propagation failed.  Refines the minimum with a ±step_s
-    binary-narrowing pass.
+    Walk the propagation window in step_s increments; return
+    (tca_unix, miss_distance_km, rel_velocity_kms, pos_a_km, pos_b_km).
+    pos_a/b are TEME ECI vectors (km) at TCA, or None if propagation failed.
+    Refines the minimum with a ±step_s binary-narrowing pass.
     """
     best_t = t0
     best_dist = float("inf")
@@ -429,7 +648,7 @@ def find_tca(
             best_rv = float(np.linalg.norm(va - vb))
         t += step_s
 
-    # Refine with bisection over ±step_s around best_t
+    # Bisection refinement over ±step_s around best_t
     lo, hi = best_t - step_s, best_t + step_s
     for _ in range(20):
         m1 = lo + (hi - lo) / 3
@@ -454,7 +673,7 @@ def find_tca(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Probability of Collision (Pc) – 2-D Gaussian integral (Alfano method)
+# Priority 6 — Screening Pc (isotropic 2-D Gaussian)
 # ──────────────────────────────────────────────────────────────────────────────
 def compute_pc(
     miss_distance_km: float,
@@ -463,24 +682,31 @@ def compute_pc(
     hard_body_radius_m: float = HARD_BODY_RADIUS_M,
 ) -> float:
     """
-    Compute Pc by integrating a 2-D Gaussian (isotropic covariance, combined
-    σ) over the combined hard-body cross-section in the encounter plane.
+    Compute a Screening Probability of Collision using a 2-D Gaussian integral
+    (simplified Alfano / Patera method).
 
-      Pc = (1 / (2π|C|^½)) ∬_A  exp(-½ rᵀ C⁻¹ r) dx dy
+    IMPORTANT CAVEATS:
+      • Uses a fixed isotropic σ=200 m; no object-specific covariance matrix.
+      • Does NOT project covariance into the encounter plane using relative
+        velocity geometry (full Alfano solution).
+      • Does NOT incorporate CDM-quality orbital determination uncertainty.
+      • The result is a screening estimate only, suitable for initial triage.
+      • Authoritative maneuver decisions require CDM data and flight-dynamics
+        review by qualified personnel.
 
-    where C = diag(σ², σ²), A is a disk of radius r_hbr = hard_body_radius_m,
-    and the miss vector is along x in the encounter plane.
+    Formula:
+      Pc = (1/(2π σ²)) ∬_A exp(−|r−r₀|²/(2σ²)) dx dy
+      where A is a disk of radius r_hbr at the origin,
+      and r₀ = (miss_m, 0) in the encounter plane.
     """
     if miss_distance_km <= 0 or relative_velocity_kms <= 0:
         return 0.0
 
-    # Convert to metres for consistent units
     miss_m = miss_distance_km * 1000.0
-    sigma = sigma_m  # 1-σ positional uncertainty (m)
-    r_hbr = hard_body_radius_m  # combined hard-body radius (m)
+    sigma  = sigma_m
+    r_hbr  = hard_body_radius_m
 
-    # Offset of the primary in the encounter plane
-    x0 = miss_m  # miss along x-axis
+    x0 = miss_m
     y0 = 0.0
 
     norm = 1.0 / (2.0 * math.pi * sigma ** 2)
@@ -488,7 +714,6 @@ def compute_pc(
     def integrand(y, x):
         return norm * math.exp(-((x - x0) ** 2 + (y - y0) ** 2) / (2.0 * sigma ** 2))
 
-    # Integrate over disk of radius r_hbr centred at origin
     try:
         pc, _ = dblquad(
             integrand,
@@ -505,117 +730,120 @@ def compute_pc(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ECI → geographic conversion
-# ──────────────────────────────────────────────────────────────────────────────
-def _eci_to_geo(pos_km: np.ndarray) -> Tuple[float, float, float]:
-    """Convert an ECI position vector (km) to (latitude_deg, longitude_deg, altitude_km).
-
-    Uses a simplified spherical-Earth model (no GMST rotation for epoch
-    alignment — positions are used only for globe visualisation, not
-    precision geodesy).
-    """
-    x, y, z = float(pos_km[0]), float(pos_km[1]), float(pos_km[2])
-    r = math.sqrt(x * x + y * y + z * z)
-    lat = math.degrees(math.asin(z / r))
-    lon = math.degrees(math.atan2(y, x))
-    alt = r - EARTH_RADIUS_KM
-    return round(lat, 4), round(lon, 4), round(alt, 4)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ──────────────────────────────────────────────────────────────────────────────
 def run_conjunction_scan(max_objects: int = 500) -> List[dict]:
     """
-    Full pipeline: fetch → LEO filter → TCA → Pc.
+    Full pipeline: fetch → LEO filter → stratified sample → spatiotemporal
+    candidate search → TCA bisection → TEME→geodetic → Screening Pc.
+
     Returns a list of conjunction dicts sorted by descending Pc (MONITOR last).
 
     Pipeline:
       1. Fetch full GP catalog (Space-Track → local fallback).
       2. Propagate ALL records to get current ECI state and altitude.
-      3. Filter to 300–1 200 km LEO band (highest conjunction density).
-      4. Sort by altitude so spatially adjacent objects cluster together.
-      5. Cap to max_objects after the altitude filter.
-      6. KD-Tree pre-filter → TCA bisection → Pc integration.
-      7. Pairs with Pc ≥ 1e-6 are tiered ELEVATED/HIGH/CRITICAL.
-         Pairs with Pc < 1e-6 (but within 10–100 km at TCA) are retained
-         as MONITOR events with pc_value=0 so the dashboard can count them.
+      3. Filter to 300–1200 km LEO band.
+      4. Stratified-sample across altitude bins (removes low-altitude bias).
+      5. Spatiotemporal coarse prefilter over 24 h at 5-min intervals.
+      6. Fine TCA bisection for each candidate pair.
+      7. TEME→geodetic conversion using GMST at TCA epoch.
+      8. Screening Pc (isotropic σ=200 m — NOT full covariance-based Pc).
+      9. Tier events; retain MONITOR band (10–100 km, Pc < 1e-6).
 
-    Each event also carries primary_lat/lon/alt and secondary_lat/lon/alt
-    computed from the ECI position vectors at TCA for globe visualisation.
+    Each event carries:
+      - primary_lat/lon/alt_km, secondary_lat/lon/alt_km  (TCA positions)
+      - pc_assumed_sigma_m, pc_hard_body_radius_m          (Pc assumptions)
+      - scan_metadata                                       (coverage info)
     """
     t0 = time.time()
     gp_records = fetch_gp_data()
 
-    # Propagate full catalog to obtain real ECI altitudes at t0
     all_sats = build_satellite_list(gp_records, t0)
 
-    # Filter to active LEO band where conjunction risk is highest
+    # Filter to active LEO band
     leo_sats = [s for s in all_sats if 300.0 <= s.altitude_km <= 1200.0]
 
-    # Sort by altitude so the KD-Tree receives spatially coherent input
-    leo_sats.sort(key=lambda s: s.altitude_km)
-
-    # Cap to max_objects after the altitude filter
-    sats = leo_sats[:max_objects]
+    # Priority 5: Stratified sample instead of altitude-sorted truncation
+    sats, coverage_meta = stratified_sample(leo_sats, max_objects)
 
     logger.info(
-        "LEO filter: %d/%d objects in 300–1200 km band, using %d for scan.",
+        "LEO filter: %d/%d objects in 300–1200 km band, using %d after stratified sample.",
         len(leo_sats), len(all_sats), len(sats),
     )
 
-    pairs = find_candidate_pairs(sats, delta_alt_km=100.0)
+    # Priority 4: Spatiotemporal prefilter
+    pairs, st_meta = find_candidate_pairs_spatiotemporal(sats, t0)
 
-    tiered: List[dict] = []   # Pc >= PC_THRESHOLD
-    monitor: List[dict] = []  # Pc < PC_THRESHOLD but within 10–100 km
+    tiered: List[dict] = []
+    monitor: List[dict] = []
 
     for i, j in pairs:
         a, b = sats[i], sats[j]
         tca, miss_km, rel_v, ra_tca, rb_tca = find_tca(a, b, t0)
+
+        # Priority 6: Screening Pc with documented assumptions
         pc = compute_pc(miss_km, rel_v)
 
-        # Build geographic positions from ECI vectors at TCA
+        # Priority 3: Epoch-aware TEME→geodetic conversion
         if ra_tca is not None:
-            p_lat, p_lon, p_alt = _eci_to_geo(ra_tca)
+            p_lat, p_lon, p_alt = teme_to_geodetic(ra_tca, tca)
         else:
             p_lat, p_lon, p_alt = 0.0, 0.0, 400.0
         if rb_tca is not None:
-            s_lat, s_lon, s_alt = _eci_to_geo(rb_tca)
+            s_lat, s_lon, s_alt = teme_to_geodetic(rb_tca, tca)
         else:
             s_lat, s_lon, s_alt = 0.0, 0.0, 400.0
 
+        # pc_value: the real computed probability (never clamped to 0).
+        # For MONITOR events (pc < PC_THRESHOLD) we preserve the real float so
+        # operators and tests can see the actual value.  The frontend formats
+        # values below the threshold as "< 1×10⁻⁶" for display.
+        pc_rounded = float(f"{pc:.6e}") if pc > 0.0 else 0.0
+
         event = {
-            "norad_id": a.norad_id,
-            "sat_name": a.name,
-            "secondary_norad_id": b.norad_id,
-            "secondary_name": b.name,
-            "tca_iso": _unix_to_iso(tca),
-            "miss_distance_km": round(miss_km, 4),
-            "relative_velocity_kms": round(rel_v, 4),
-            "pc_value": float(f"{pc:.6e}") if pc >= PC_THRESHOLD else 0.0,
-            "primary_lat": p_lat,
-            "primary_lon": p_lon,
-            "primary_alt_km": p_alt,
-            "secondary_lat": s_lat,
-            "secondary_lon": s_lon,
-            "secondary_alt_km": s_alt,
+            "norad_id":                 a.norad_id,
+            "sat_name":                 a.name,
+            "secondary_norad_id":       b.norad_id,
+            "secondary_name":           b.name,
+            "tca_iso":                  _unix_to_iso(tca),
+            "miss_distance_km":         round(miss_km, 4),
+            "relative_velocity_kms":    round(rel_v, 4),
+            "pc_value":                 pc_rounded,   # real value; 0.0 only if compute_pc returned 0
+            "primary_lat":              p_lat,
+            "primary_lon":              p_lon,
+            "primary_alt_km":           p_alt,
+            "secondary_lat":            s_lat,
+            "secondary_lon":            s_lon,
+            "secondary_alt_km":         s_alt,
+            # Screening Pc assumptions (Priority 6)
+            "pc_assumed_sigma_m":       DEFAULT_SIGMA_M,
+            "pc_hard_body_radius_m":    HARD_BODY_RADIUS_M,
+            "pc_method":                "screening-isotropic-gaussian",
         }
 
         if pc >= PC_THRESHOLD:
             tiered.append(event)
         elif 10.0 <= miss_km <= 100.0:
-            # Within close-approach band but below statistical threshold —
-            # retain as MONITOR so operators can see the tracked proximity.
             monitor.append(event)
 
     tiered.sort(key=lambda r: r["pc_value"], reverse=True)
-    results = tiered + monitor  # MONITOR always appended after risk-sorted events
+    results = tiered + monitor
 
     logger.info(
-        "Scan complete: %d tiered events (Pc ≥ 1e-6) + %d MONITOR events.",
+        "Scan complete: %d tiered (Pc ≥ 1e-6) + %d MONITOR events.",
         len(tiered), len(monitor),
     )
-    return results
+
+    scan_metadata = {
+        **coverage_meta,
+        **st_meta,
+        "prefilter_limitation": (
+            "Fast-pass conjunctions (relative speed > screen_km / coarse_s) "
+            "may not be detected by the coarse prefilter."
+        ),
+    }
+
+    return results, scan_metadata
 
 
 def _unix_to_iso(unix_ts: float) -> str:
