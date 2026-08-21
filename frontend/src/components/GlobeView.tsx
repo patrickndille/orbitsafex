@@ -133,9 +133,18 @@ const RISK_CSS: Record<string, string> = {
 // ── props ─────────────────────────────────────────────────────────────────────
 interface GlobeViewProps {
   events: ConjunctionEvent[];
-  selectedEvent?: ConjunctionEvent | null;
-  /** Called when the operator closes the inset (clears click-lock) */
-  onCloseInset?: () => void;
+  /**
+   * The event to display in the encounter inset — either hovered or selected.
+   * When both exist, the parent passes `hoveredEvent ?? selectedEvent`.
+   */
+  focusEvent?: ConjunctionEvent | null;
+  /**
+   * The click-locked selection.  Used to decide whether to show the close
+   * button and to keep the inset visible after mouse-leave.
+   */
+  lockedEvent?: ConjunctionEvent | null;
+  /** Called when the operator dismisses the locked selection (× button). */
+  onCloseLockedEvent?: () => void;
 }
 
 // ── EncounterInset — Canvas 2-D magnified encounter overlay ───────────────────
@@ -315,15 +324,21 @@ function EncounterInset({ event, locked, onClose }: EncounterInsetProps) {
 }
 
 // ── component ─────────────────────────────────────────────────────────────────
-export default function GlobeView({ events, selectedEvent, onCloseInset }: GlobeViewProps) {
+export default function GlobeView({
+  events,
+  focusEvent,
+  lockedEvent,
+  onCloseLockedEvent,
+}: GlobeViewProps) {
   const mountRef    = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const frameRef    = useRef<number>(0);
 
-  // Hold latest selectedEvent in a ref so the animation loop and overlay
-  // update function can access it without triggering scene recreation.
-  const selectedEventRef = useRef<ConjunctionEvent | null | undefined>(selectedEvent);
-  selectedEventRef.current = selectedEvent;
+  // focusEvent drives the Three.js globe overlay (glyph + arc).
+  // We keep it in a ref so the animation loop and buildOverlay can read it
+  // without being declared in the effect dependency array.
+  const focusEventRef = useRef<ConjunctionEvent | null | undefined>(focusEvent);
+  focusEventRef.current = focusEvent;
 
   // selGroupRef lets the overlay-update effect reach the Three.js group
   // that was created in the scene-setup effect.
@@ -332,7 +347,7 @@ export default function GlobeView({ events, selectedEvent, onCloseInset }: Globe
   const buildOverlayFn = useRef<((evt: ConjunctionEvent | null | undefined) => void) | null>(null);
 
   // Camera snap target shared between Effect 1 (writes initial value,
-  // reads every animation frame) and Effect 2 (writes when selectedEvent
+  // reads every animation frame) and Effect 2 (writes when focusEvent
   // changes).  Using a plain object ref avoids any React re-render cost.
   const snapRef = useRef<{ rotY: number; rotX: number; active: boolean }>({
     rotY: 0, rotX: 0, active: false,
@@ -537,11 +552,11 @@ export default function GlobeView({ events, selectedEvent, onCloseInset }: Globe
       selGroup.add(glowTube);
     };
 
-    // Expose to the selectedEvent effect
+    // Expose to the focusEvent effect
     buildOverlayFn.current = buildOverlay;
 
     // Draw initial overlay from the current ref value
-    buildOverlay(selectedEventRef.current);
+    buildOverlay(focusEventRef.current);
 
     // Point snap ref at the shared object — read by animation loop each frame.
     // This avoids storing snap state on the Three.js group (which would require
@@ -549,7 +564,7 @@ export default function GlobeView({ events, selectedEvent, onCloseInset }: Globe
     const snap = snapRef.current;
 
     // Compute initial snap from current selectedEvent ref
-    const initEvt = selectedEventRef.current;
+    const initEvt = focusEventRef.current;
     if (initEvt) {
       const pLat = initEvt.primary_lat   ?? noradToLatLon(initEvt.norad_id)[0];
       const pLon = initEvt.primary_lon   ?? noradToLatLon(initEvt.norad_id)[1];
@@ -648,23 +663,21 @@ export default function GlobeView({ events, selectedEvent, onCloseInset }: Globe
       selGroupRef.current    = null;
       if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
     };
-  }, [events]); // ← only `events`; selectedEvent changes do NOT recreate the scene
+  }, [events]); // ← only `events`; focusEvent changes do NOT recreate the scene
 
-  // ── Effect 2: update overlay when selectedEvent changes (no scene rebuild) ──
+  // ── Effect 2: update Three.js globe glyph when focusEvent changes ────────────
+  // React renders the EncounterInset overlay independently (see JSX below).
   useEffect(() => {
-    // Update the encounter overlay (canvas 2-D inset is handled by React
-    // rendering EncounterInset below; this updates the Three.js globe glyph).
     if (buildOverlayFn.current) {
-      buildOverlayFn.current(selectedEvent);
+      buildOverlayFn.current(focusEvent);
     }
 
-    // Update camera snap target via the shared ref — directly accessible from
-    // both this effect and the animation loop without any scene traversal.
-    if (selectedEvent) {
-      const pLat = selectedEvent.primary_lat   ?? noradToLatLon(selectedEvent.norad_id)[0];
-      const pLon = selectedEvent.primary_lon   ?? noradToLatLon(selectedEvent.norad_id)[1];
-      const sLat = selectedEvent.secondary_lat ?? noradToLatLon(selectedEvent.secondary_norad_id)[0];
-      const sLon = selectedEvent.secondary_lon ?? noradToLatLon(selectedEvent.secondary_norad_id)[1];
+    // Camera snap follows focusEvent (hover preview or locked selection).
+    if (focusEvent) {
+      const pLat = focusEvent.primary_lat   ?? noradToLatLon(focusEvent.norad_id)[0];
+      const pLon = focusEvent.primary_lon   ?? noradToLatLon(focusEvent.norad_id)[1];
+      const sLat = focusEvent.secondary_lat ?? noradToLatLon(focusEvent.secondary_norad_id)[0];
+      const sLon = focusEvent.secondary_lon ?? noradToLatLon(focusEvent.secondary_norad_id)[1];
       const [midLat, midLon] = geoMidpoint(pLat, pLon, sLat, sLon);
       snapRef.current.rotY   = -(midLon * DEG) - Math.PI / 2;
       snapRef.current.rotX   = -(midLat * DEG) * 0.7;
@@ -672,23 +685,43 @@ export default function GlobeView({ events, selectedEvent, onCloseInset }: Globe
     } else {
       snapRef.current.active = false;
     }
-  }, [selectedEvent]);
+  }, [focusEvent]);
+
+  // Determine if the currently displayed focusEvent is the click-locked one
+  // (same pair by both NORAD IDs).
+  const isLocked =
+    !!lockedEvent &&
+    !!focusEvent &&
+    lockedEvent.norad_id === focusEvent.norad_id &&
+    lockedEvent.secondary_norad_id === focusEvent.secondary_norad_id;
 
   return (
-    <div className="w-full h-full flex flex-col">
+    /*
+     * Positioned viewport: Three.js canvas is absolute-inset so it always
+     * fills the full container — its height is NEVER changed by the overlay.
+     * The EncounterInset is an absolute overlay anchored to the bottom of the
+     * same container; it floats over the globe without affecting layout flow.
+     */
+    <div className="relative w-full h-full overflow-hidden">
       <div
         ref={mountRef}
-        className="flex-1 overflow-hidden cursor-grab active:cursor-grabbing"
-        style={{ minHeight: "280px" }}
+        className="absolute inset-0 cursor-grab active:cursor-grabbing"
       />
 
-      {selectedEvent && (
-        <div className="px-3 pb-3 pt-2 bg-space-950/80 border-t border-red-900/30 shrink-0">
-          <EncounterInset
-            event={selectedEvent}
-            locked={true}
-            onClose={onCloseInset}
-          />
+      {focusEvent && (
+        <div
+          className="absolute left-2 right-2 bottom-2 sm:left-3 sm:right-3 sm:bottom-3 z-20 pointer-events-none"
+          data-testid="encounter-inset-wrapper"
+        >
+          {/* pointer-events-none on wrapper so globe drag works outside the card;
+              pointer-events-auto restored on the card itself so buttons are clickable */}
+          <div className="pointer-events-auto max-w-[480px] mx-auto">
+            <EncounterInset
+              event={focusEvent}
+              locked={isLocked}
+              onClose={isLocked ? onCloseLockedEvent : undefined}
+            />
+          </div>
         </div>
       )}
     </div>

@@ -17,6 +17,8 @@ const PAGE_SIZE = 25;
 interface Props {
   events: ConjunctionEvent[];
   loading: boolean;
+  /** Optional elapsed seconds to show while loading */
+  loadingElapsed?: number;
   onSelectEvent: (event: ConjunctionEvent) => void;
   /** The currently click-locked selection (persists after hover ends) */
   selectedEvent?: ConjunctionEvent | null;
@@ -46,7 +48,7 @@ const TIER_SELECTED_BG: Record<string, string> = {
   MONITOR:  "bg-slate-700/40 ring-1 ring-slate-500/50",
 };
 
-export default function ConjunctionTable({ events, loading, onSelectEvent, selectedEvent, onHoverEvent }: Props) {
+export default function ConjunctionTable({ events, loading, loadingElapsed, onSelectEvent, selectedEvent, onHoverEvent }: Props) {
   const [search, setSearch] = useState("");
   const [tierFilter, setTierFilter] = useState<string>("ALL");
   const [sortAsc, setSortAsc] = useState(false);
@@ -160,6 +162,16 @@ export default function ConjunctionTable({ events, loading, onSelectEvent, selec
                   <div className="flex flex-col items-center gap-3">
                     <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
                     <span>Running orbital scan…</span>
+                    {loadingElapsed !== undefined && loadingElapsed > 0 && (
+                      <span className="text-xs font-mono tabular-nums text-slate-600">
+                        {loadingElapsed}s elapsed · SGP4 propagation in progress
+                      </span>
+                    )}
+                    {loadingElapsed !== undefined && loadingElapsed > 30 && (
+                      <span className="text-xs text-slate-700 max-w-xs text-center">
+                        Large catalog scan can take 1–3 min. The result will appear automatically.
+                      </span>
+                    )}
                   </div>
                 </td>
               </tr>

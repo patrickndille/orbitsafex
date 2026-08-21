@@ -44,6 +44,8 @@ export interface ScanMetadata {
   satellites_evaluated?: number;
   coarse_epochs_evaluated?: number;
   candidate_pairs?: number;
+  candidate_pairs_before_cap?: number;
+  candidate_pairs_capped?: boolean;
   /** Explicit statement of the prefilter's fast-pass screening gap. */
   prefilter_limitation?: string;
 }

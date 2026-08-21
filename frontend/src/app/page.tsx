@@ -80,6 +80,8 @@ export default function DashboardPage() {
   // hoveredEvent — transient preview while hovering a table row
   const [hoveredEvent, setHoveredEvent]   = useState<ConjunctionEvent | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+  // Elapsed seconds while a scan is in progress — updated every second
+  const [scanElapsed, setScanElapsed] = useState(0);
 
   // Globe glyph follows hover first; falls back to the click-locked selection.
   // The encounter inset in GlobeView is only shown for the click-locked selection.
@@ -103,6 +105,12 @@ export default function DashboardPage() {
   const runScan = useCallback(async () => {
     setLoading(true);
     setScanError(null);
+    setScanElapsed(0);
+    const startTs = Date.now();
+    const elapsedTimer = setInterval(
+      () => setScanElapsed(Math.round((Date.now() - startTs) / 1000)),
+      1000
+    );
     try {
       const data = await fetchConjunctions(400);
       setEvents(data.events);
@@ -110,6 +118,7 @@ export default function DashboardPage() {
     } catch (e) {
       setScanError(e instanceof Error ? e.message : String(e));
     } finally {
+      clearInterval(elapsedTimer);
       setLoading(false);
     }
   }, []);
@@ -153,6 +162,11 @@ export default function DashboardPage() {
             {loading ? "Scanning…" : scanError ? "Error" : "Nominal"}
           </div>
 
+          {loading && (
+            <span className="hidden md:block text-xs text-yellow-600 font-mono tabular-nums">
+              Scanning… {scanElapsed}s
+            </span>
+          )}
           {lastScan && !loading && (
             <span className="hidden md:block text-xs text-slate-600 font-mono">
               Last scan: {lastScan.toUTCString().substring(17, 25)} UTC
@@ -223,8 +237,13 @@ export default function DashboardPage() {
         <div className="mx-6 mb-3 flex items-center gap-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
           <AlertTriangle className="w-4 h-4 shrink-0" />
           <span>
-            <strong>Scan error:</strong> {scanError}. Make sure the FastAPI backend is running on{" "}
-            <code className="font-mono text-red-400">localhost:8000</code>.
+            <strong>Scan error:</strong>{" "}
+            {scanError.includes("timed out")
+              ? scanError
+              : `${scanError} — make sure the FastAPI backend is running on `}
+            {!scanError.includes("timed out") && (
+              <code className="font-mono text-red-400">localhost:8000</code>
+            )}
           </span>
         </div>
       )}
@@ -253,8 +272,9 @@ export default function DashboardPage() {
           <div className="h-[420px] xl:h-0 xl:flex-1 rounded-xl border border-slate-700/50 overflow-hidden bg-space-900">
             <GlobeView
               events={events}
-              selectedEvent={globeEvent}
-              onCloseInset={handleCloseSelection}
+              focusEvent={globeEvent}
+              lockedEvent={selectedEvent}
+              onCloseLockedEvent={handleCloseSelection}
             />
           </div>
 
@@ -290,6 +310,7 @@ export default function DashboardPage() {
             <ConjunctionTable
                events={events}
                loading={loading}
+               loadingElapsed={scanElapsed}
                selectedEvent={selectedEvent}
                onSelectEvent={handleSelectEvent}
                onHoverEvent={setHoveredEvent}

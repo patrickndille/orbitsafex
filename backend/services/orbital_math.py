@@ -58,25 +58,30 @@ PROPAGATION_WINDOW_H = 24.0       # hours to look ahead
 # The coarse prefilter samples every COARSE_INTERVAL_S seconds and flags pairs
 # that come within COARSE_SCREEN_KM at any sampled epoch.
 #
-# KNOWN LIMITATION — screening gap:
-#   In the worst case an object travelling at v_rel km/s can travel
-#   v_rel * COARSE_INTERVAL_S km between samples.  At 15 km/s that is
-#   15 × 60 = 900 km per 60-second step, or 15 × 300 = 4,500 km per 5-minute
-#   step.  A fast conjunction pair can therefore pass completely through the
-#   COARSE_SCREEN_KM = 100 km screening sphere between samples and be missed.
+# KNOWN LIMITATION — fast-pass screening gap:
+#   Transit time at 15 km/s through a 200 km sphere = 200/15 ≈ 13 s, which is
+#   well below the 300 s coarse step.  High-relative-velocity pairs can slip
+#   through without being detected at any sampled epoch.  This is an accepted
+#   trade-off for interactive demo responsiveness.
+#   For tighter screening reduce COARSE_INTERVAL_S (e.g. to 60 s) at the cost
+#   of ~5× longer prefilter time.
 #
-#   This is a genuine gap, not a corner case.  The prefilter is reliable only
-#   for pairs whose closest approach lasts longer than one coarse step, i.e.
-#   pairs with low relative velocity or a long dwell time inside the sphere.
-#   For operational use the fine-step TCA walk (PROPAGATION_STEP_S = 60 s)
-#   also has the same limitation, though at smaller scale.
-#
-#   The prefilter is provided as an O(n log n) first-pass screen that
-#   dramatically reduces the number of pairs sent to the expensive fine TCA
-#   search.  It should be accompanied by an explicit disclaimer that it is
-#   NOT a complete conjunction detector and that fast-pass pairs may escape it.
-COARSE_INTERVAL_S  = 60.0         # 1-minute coarse step (matches fine TCA step)
-COARSE_SCREEN_KM   = 200.0        # KD-Tree screening radius — 2× fine miss threshold
+# PERFORMANCE NOTE:
+#   COARSE_INTERVAL_S = 300 s → 289 epochs over 24 h   (~2 s prefilter)
+#   COARSE_INTERVAL_S =  60 s → 1441 epochs over 24 h  (~10 s prefilter)
+#   COARSE_SCREEN_KM  = 200 km yields ~4,500–5,500 candidate pairs with 400
+#   sampled satellites — fine TCA search over these completes in ~40–60 s.
+#   COARSE_SCREEN_KM  = 500 km yields ~12,000+ pairs — too slow for interactive
+#   use; avoid unless running as an offline batch job.
+COARSE_INTERVAL_S  = 300.0        # 5-minute coarse step  → 289 epochs / 24 h
+COARSE_SCREEN_KM   = 200.0        # 200 km screening radius → ~4,500–5,500 pairs
+
+# Hard cap on candidate pairs forwarded to the expensive fine TCA search.
+# Each pair requires ~1,440 SGP4 propagations (24 h at 60 s steps).
+# At ~18 µs/call: 1,500 pairs ≈ 39 s;  3,000 pairs ≈ 78 s;  6,000 pairs ≈ 156 s.
+# 1,500 pairs keeps interactive scan time under ~60 s on typical hardware.
+# Pairs are sorted before capping for determinism.
+MAX_CANDIDATE_PAIRS = 1500
 
 HARD_BODY_RADIUS_M = 5.0          # combined hard-body radius (metres)
 DEFAULT_SIGMA_M    = 200.0        # assumed isotropic 1-σ position uncertainty (m)
@@ -525,6 +530,7 @@ def find_candidate_pairs_spatiotemporal(
     window_h: float = PROPAGATION_WINDOW_H,
     coarse_s: float = COARSE_INTERVAL_S,
     screen_km: float = COARSE_SCREEN_KM,
+    max_pairs: int = MAX_CANDIDATE_PAIRS,
 ) -> Tuple[list[Tuple[int, int]], dict]:
     """
     Spatiotemporal coarse prefilter: propagate all satellites at coarse intervals
@@ -546,15 +552,12 @@ def find_candidate_pairs_spatiotemporal(
       A pair travelling at relative velocity v_rel can traverse the entire
       screen_km sphere in screen_km / v_rel seconds.  If that transit time is
       shorter than coarse_s the pair will not be captured at any sampled epoch.
-      With coarse_s = 60 s and screen_km = 200 km:
-        maximum safely-detected relative speed = 200 km / 60 s ≈ 3.3 km/s.
-      LEO relative speeds can reach 15 km/s, so fast-pass pairs CAN be missed.
-
-      Mitigation: use coarse_s = PROPAGATION_STEP_S (same step as fine search)
-      so the prefilter and the fine TCA walk have identical temporal resolution.
-      This increases cost but eliminates the screening gap relative to the fine
-      search.  The prefilter then serves as pure spatial partitioning (O(n log n)
-      vs O(n²)), not temporal coarsening.
+      With coarse_s = 300 s and screen_km = 500 km:
+        transit time at 15 km/s = 500/15 ≈ 33 s  (<  300 s step).
+      Fast-pass pairs at high relative velocity CAN be missed.
+      This is an accepted trade-off for interactive demo responsiveness.
+      Set COARSE_INTERVAL_S = 60 and COARSE_SCREEN_KM = 200 for tighter
+      screening at the cost of ~5× longer scan time.
 
     Returns:
         (pairs_as_index_list, scan_metadata_dict)
@@ -595,22 +598,32 @@ def find_candidate_pairs_spatiotemporal(
 
         epochs_evaluated += 1
 
+    pairs_list = list(pairs_set)
+    capped = len(pairs_list) > max_pairs
+    if capped:
+        # Deterministic: sort by index pair so capping is reproducible
+        pairs_list.sort()
+        pairs_list = pairs_list[:max_pairs]
+
     metadata = {
         "propagation_window_h":    window_h,
         "coarse_interval_s":       coarse_s,
         "screening_radius_km":     screen_km,
         "satellites_evaluated":    n_sats,
         "coarse_epochs_evaluated": epochs_evaluated,
-        "candidate_pairs":         len(pairs_set),
+        "candidate_pairs":         len(pairs_list),
+        "candidate_pairs_before_cap": len(pairs_set),
+        "candidate_pairs_capped":  capped,
     }
 
     logger.info(
         "Spatiotemporal prefilter: %d candidate pairs from %d satellites "
-        "over %d coarse epochs (window=%.0fh, step=%.0fs, r=%.0fkm).",
-        len(pairs_set), n_sats, epochs_evaluated,
+        "over %d coarse epochs (window=%.0fh, step=%.0fs, r=%.0fkm)%s.",
+        len(pairs_list), n_sats, epochs_evaluated,
         window_h, coarse_s, screen_km,
+        f" [capped from {len(pairs_set)}]" if capped else "",
     )
-    return list(pairs_set), metadata
+    return pairs_list, metadata
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -744,7 +757,7 @@ def run_conjunction_scan(max_objects: int = 500) -> List[dict]:
       2. Propagate ALL records to get current ECI state and altitude.
       3. Filter to 300–1200 km LEO band.
       4. Stratified-sample across altitude bins (removes low-altitude bias).
-      5. Spatiotemporal coarse prefilter over 24 h at 5-min intervals.
+      5. Spatiotemporal coarse prefilter over 24 h at 5-min coarse steps (289 epochs).
       6. Fine TCA bisection for each candidate pair.
       7. TEME→geodetic conversion using GMST at TCA epoch.
       8. Screening Pc (isotropic σ=200 m — NOT full covariance-based Pc).

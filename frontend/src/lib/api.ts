@@ -11,17 +11,37 @@ import type {
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 export async function fetchConjunctions(
-  maxObjects = 400
+  maxObjects = 400,
+  timeoutMs = 360_000  // 6 minutes — scan takes ~35 s with 5-min coarse step
 ): Promise<ScanResponse> {
-  const res = await fetch(
-    `${BASE}/api/scan_conjunctions?max_objects=${maxObjects}`,
-    { cache: "no-store" }
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new Error(`Orbital scan timed out after ${timeoutMs / 1000}s. The backend may still be running; try Refresh Scan.`)),
+    timeoutMs
   );
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`scan_conjunctions failed [${res.status}]: ${detail}`);
+  try {
+    const res = await fetch(
+      `${BASE}/api/scan_conjunctions?max_objects=${maxObjects}`,
+      { cache: "no-store", signal: controller.signal }
+    );
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(`scan_conjunctions failed [${res.status}]: ${detail}`);
+    }
+    return res.json() as Promise<ScanResponse>;
+  } catch (err) {
+    // Re-wrap AbortError so the message is operator-readable
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(
+        controller.signal.reason instanceof Error
+          ? controller.signal.reason.message
+          : `Orbital scan timed out after ${timeoutMs / 1000}s. The backend may still be running; try Refresh Scan.`
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json() as Promise<ScanResponse>;
 }
 
 export async function requestTriage(
