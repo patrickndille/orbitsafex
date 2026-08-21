@@ -303,7 +303,7 @@ export default function DashboardPage() {
               <Activity className="w-4 h-4 text-blue-400" />
               Conjunction Event Log
             </h2>
-            <span className="text-xs text-slate-600">Sorted by Pc · Click row for AI triage</span>
+            <span className="text-xs text-slate-600">Sort by Pc or Miss Dist · Click row for AI triage</span>
           </div>
           {/* h-0 + flex-1 lets the table fill all remaining column height on xl */}
           <div className="xl:h-0 xl:flex-1 h-[600px]">

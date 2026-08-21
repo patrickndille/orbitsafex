@@ -3,7 +3,7 @@
 /**
  * ConjunctionTable.tsx
  * Interactive table of conjunction events.
- * Features: sort by Pc, NORAD ID search, risk-tier filter, row click → triage.
+ * Features: sort by Pc or Miss Distance, NORAD ID search, risk-tier filter, row click → triage.
  */
 
 import { useState, useMemo } from "react";
@@ -48,9 +48,12 @@ const TIER_SELECTED_BG: Record<string, string> = {
   MONITOR:  "bg-slate-700/40 ring-1 ring-slate-500/50",
 };
 
+type SortField = "pc_value" | "miss_distance_km";
+
 export default function ConjunctionTable({ events, loading, loadingElapsed, onSelectEvent, selectedEvent, onHoverEvent }: Props) {
   const [search, setSearch] = useState("");
   const [tierFilter, setTierFilter] = useState<string>("ALL");
+  const [sortField, setSortField] = useState<SortField>("pc_value");
   const [sortAsc, setSortAsc] = useState(false);
   const [page, setPage] = useState(1);
 
@@ -69,10 +72,12 @@ export default function ConjunctionTable({ events, loading, loadingElapsed, onSe
       list = list.filter((e) => getRiskTier(e.pc_value) === tierFilter);
     }
     list.sort((a, b) =>
-      sortAsc ? a.pc_value - b.pc_value : b.pc_value - a.pc_value
+      sortAsc
+        ? a[sortField] - b[sortField]
+        : b[sortField] - a[sortField]
     );
     return list;
-  }, [events, search, tierFilter, sortAsc]);
+  }, [events, search, tierFilter, sortField, sortAsc]);
 
   // Reset to page 1 whenever the filtered set changes
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
@@ -87,7 +92,17 @@ export default function ConjunctionTable({ events, loading, loadingElapsed, onSe
   // Reset page to 1 when filter/search changes
   const handleSearch = (v: string) => { setSearch(v); setPage(1); };
   const handleTier   = (t: string) => { setTierFilter(t); setPage(1); };
-  const handleSort   = () => { setSortAsc(!sortAsc); setPage(1); };
+
+  /** Toggle sort: clicking the active column flips direction; clicking a new column defaults to descending. */
+  const handleSort = (field: SortField) => {
+    if (field === sortField) {
+      setSortAsc(!sortAsc);
+    } else {
+      setSortField(field);
+      setSortAsc(false); // default: highest first for a new column
+    }
+    setPage(1);
+  };
 
   return (
     <div className="flex flex-col h-full bg-space-900 rounded-xl border border-slate-700/50 overflow-hidden">
@@ -140,15 +155,29 @@ export default function ConjunctionTable({ events, loading, loadingElapsed, onSe
               <th className="px-4 py-2.5 text-left font-medium">Risk</th>
               <th className="px-4 py-2.5 text-left font-medium">Primary Satellite</th>
               <th className="px-4 py-2.5 text-left font-medium">Secondary Object</th>
-              <th className="px-4 py-2.5 text-right font-medium">Miss Dist (km)</th>
+              <th
+                className="px-4 py-2.5 text-right font-medium cursor-pointer select-none group"
+                onClick={() => handleSort("miss_distance_km")}
+              >
+                <span className="flex items-center justify-end gap-1">
+                  Miss Dist (km)
+                  <ArrowUpDown className={clsx(
+                    "w-3.5 h-3.5 transition",
+                    sortField === "miss_distance_km" ? "text-blue-400" : "text-slate-500 group-hover:text-blue-400"
+                  )} />
+                </span>
+              </th>
               <th className="px-4 py-2.5 text-right font-medium">Rel. Velocity (km/s)</th>
               <th
                 className="px-4 py-2.5 text-right font-medium cursor-pointer select-none group"
-                onClick={handleSort}
+                onClick={() => handleSort("pc_value")}
               >
                 <span className="flex items-center justify-end gap-1">
                   Pc Value
-                  <ArrowUpDown className="w-3.5 h-3.5 text-slate-500 group-hover:text-blue-400 transition" />
+                  <ArrowUpDown className={clsx(
+                    "w-3.5 h-3.5 transition",
+                    sortField === "pc_value" ? "text-blue-400" : "text-slate-500 group-hover:text-blue-400"
+                  )} />
                 </span>
               </th>
               <th className="px-4 py-2.5 text-center font-medium">TCA (UTC)</th>
