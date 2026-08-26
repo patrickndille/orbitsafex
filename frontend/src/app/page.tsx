@@ -242,7 +242,7 @@ export default function DashboardPage() {
               ? scanError
               : `${scanError} — make sure the FastAPI backend is running on `}
             {!scanError.includes("timed out") && (
-              <code className="font-mono text-red-400">localhost:8000</code>
+              <code className="font-mono text-red-400">{process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}</code>
             )}
           </span>
         </div>
