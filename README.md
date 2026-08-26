@@ -474,7 +474,7 @@ Copy-Item .env.example .env
 #              SPACE_TRACK_USERNAME, SPACE_TRACK_PASSWORD
 
 # Start the FastAPI server
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
 API: `http://localhost:8000` · Interactive docs: `http://localhost:8000/docs`
