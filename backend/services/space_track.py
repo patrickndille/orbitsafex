@@ -18,15 +18,16 @@ SPACE_TRACK_BASE = "https://www.space-track.org"
 LOGIN_URL        = f"{SPACE_TRACK_BASE}/ajaxauth/login"
 WHOAMI_URL       = f"{SPACE_TRACK_BASE}/app/data/whoami"
 
-# Per Space-Track API guidelines (GP class, hourly retrieval):
-#   decay_date/null-val        → exclude decayed/re-entered objects
-#   CREATION_DATE/%3Enow-0.042 → only elements uploaded in the last ~60 min
-#                                (0.042 days ≈ 1 hour; matches GP update cadence)
-# epoch/%3Enow-10 is the slower one-time full-catalog variant; avoid for scripts.
+# Per Space-Track API guidelines (GP class):
+#   decay_date/null-val   → exclude decayed/re-entered objects
+#   epoch/%3Enow-10       → elements with epoch within the last 10 days
+#                           (covers all active catalog objects; Space-Track
+#                            recommends this for full-catalog retrieval)
 GP_QUERY_URL = (
     f"{SPACE_TRACK_BASE}/basicspacedata/query/class/gp"
     "/decay_date/null-val"
-    "/CREATION_DATE/%3Enow-0.042"
+    "/epoch/%3Enow-10"
+    "/orderby/NORAD_CAT_ID"
     "/format/json"
 )
 
